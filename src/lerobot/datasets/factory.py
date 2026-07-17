@@ -27,6 +27,7 @@ from lerobot.datasets.lerobot_dataset import (
     MultiLeRobotDataset,
 )
 from lerobot.datasets.transforms import ImageTransforms
+from lerobot.datasets.adapters import get_dataset_adapter
 
 IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
@@ -106,6 +107,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             revision=revision,
             local_files_only=local_files_only,
         )
+        feature_adapter = get_dataset_adapter(ds_meta.robot_type)
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
@@ -122,10 +124,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             max_state_dim=cfg.dataset.max_state_dim,
             max_num_images=cfg.dataset.max_num_images,
             max_image_dim=cfg.dataset.max_image_dim,
+            feature_adapter=feature_adapter,
         )
     else:
         delta_timestamps = {}
         episodes = {}
+        feature_adapters = {}
         root = getattr(cfg.dataset, "root", None)
         # If root is provided, use local_files_only=True to prevent downloads from HuggingFace
 
@@ -142,6 +146,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             )  # FIXME(mshukor): ?
             delta_timestamps[repo_id[i]] = resolve_delta_timestamps(cfg.policy, ds_meta)
             episodes[repo_id[i]] = EPISODES_DATASET_MAPPING.get(repo_id[i], cfg.dataset.episodes)
+            feature_adapters[repo_id[i]] = get_dataset_adapter(ds_meta.robot_type)
         # training_features = TRAINING_FEATURES.get(cfg.dataset.features_version, None)
         # FIXME: (jadechoghari): check support for training features
         training_features = None
@@ -170,6 +175,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             motion_threshold=cfg.dataset.motion_threshold,
             motion_window_size=cfg.dataset.motion_window_size,
             motion_buffer=cfg.dataset.motion_buffer,
+            feature_adapters=feature_adapters,
         )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "

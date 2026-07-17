@@ -265,6 +265,11 @@ def pad_vector(vector, new_dim):
         return vector
     shape = list(vector.shape)
     current_dim = shape[-1]
+    if current_dim > new_dim:
+        raise ValueError(
+            f"Cannot pad a vector from dimension {current_dim} down to {new_dim}. "
+            "Project the dataset feature before passing it to the policy."
+        )
     shape[-1] = new_dim
     new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
     new_vector[..., :current_dim] = vector
@@ -524,7 +529,7 @@ class SmolVLA2Policy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         actions = self.prepare_action(batch, state=state)
-        actions_is_pad = batch.get("actions_id_pad")
+        actions_is_pad = batch.get(f"{ACTION}_is_pad")
         loss_dict = {}
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         loss_dict["losses_after_forward"] = losses.clone()

@@ -18,6 +18,7 @@ import logging
 
 from torch import nn
 
+from lerobot.constants import ACTION, OBS_STATE
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -76,21 +77,18 @@ def make_policy(
     kwargs = {}
     # Parse features from dataset metadata (required for SmolVLA2)
     features = dataset_to_policy_features(ds_meta.features)
-    # Handle robot-type grouped stats - flatten to feature-level stats  
-    if ds_meta.stats and len(ds_meta.stats) == 1:
-        # Single robot type - use its stats directly
-        robot_type = list(ds_meta.stats.keys())[0]
-        kwargs["dataset_stats"] = ds_meta.stats[robot_type]
-    elif ds_meta.stats and len(ds_meta.stats) > 1:
-        # Multiple robot types - aggregate statistics across all robot types
-        # This handles multidataset scenarios where each dataset has its own robot type
+    # Single-dataset stats are keyed by feature name. Multi-dataset stats are grouped by robot type.
+    if ds_meta.stats and (ACTION in ds_meta.stats or OBS_STATE in ds_meta.stats):
+        kwargs["dataset_stats"] = ds_meta.stats
+    elif ds_meta.stats:
         aggregated_stats = {}
         for robot_type, stats in ds_meta.stats.items():
             for feature_name, feature_stats in stats.items():
                 if feature_name not in aggregated_stats:
                     aggregated_stats[feature_name] = feature_stats
                 else:
-                    # For multidataset, we need to handle the aggregation properly
+                    # Statistics are already aggregated per robot type by MultiLeRobotDatasetMeta.
+                    # Keep the first compatible feature statistics for the shared policy buffers.
                     pass
         kwargs["dataset_stats"] = aggregated_stats
     else:

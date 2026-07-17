@@ -414,6 +414,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         motion_threshold: float = 5e-2,
         motion_window_size: int = 10,
         motion_buffer: int = 3,
+        feature_adapter=None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -533,6 +534,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.motion_threshold = motion_threshold
         self.motion_window_size = motion_window_size
         self.motion_buffer = motion_buffer
+        self.feature_adapter = feature_adapter
 
         # Unused attributes
         self.image_writer = None
@@ -657,6 +659,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
             training_features=self.training_features,
         )
         self.robot_type = self.meta.info.get("robot_type", "")
+        if self.feature_adapter is not None:
+            self.feature_adapter.adapt_metadata(self.meta)
+            if hasattr(self, "stats"):
+                self.stats = self.feature_adapter.project_stats(self.stats)
         # Override tasks
         self.meta.tasks = TASKS_KEYS_MAPPING.get(self.repo_id, self.meta.tasks)
 
@@ -925,6 +931,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         item = map_dict_keys(
             item, feature_keys_mapping=self.feature_keys_mapping, training_features=self.training_features
         )
+        if self.feature_adapter is not None:
+            item = self.feature_adapter.adapt_item(item)
         # Add padded features
         # item = self._add_padded_features(item, self.training_features)
         if self.image_transforms is not None:
@@ -1347,6 +1355,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         motion_threshold: float = 0.05,
         motion_window_size: int = 10,
         motion_buffer: int = 3,
+        feature_adapters: dict[str, object] | None = None,
     ):
         super().__init__()
         self.repo_ids = repo_ids
@@ -1377,6 +1386,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                         tolerance_s=self.tolerances_s[repo_id],
                         download_videos=download_videos,
                         video_backend=video_backend,
+                        local_files_only=local_files_only,
                         feature_keys_mapping=feature_keys_mapping,
                         training_features=training_features,
                         discard_first_n_frames=discard_first_n_frames,
@@ -1384,6 +1394,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                         motion_threshold=motion_threshold,
                         motion_window_size=motion_window_size,
                         motion_buffer=motion_buffer,
+                        feature_adapter=feature_adapters.get(repo_id) if feature_adapters else None,
                     )
                 )
                 datasets_repo_ids.append(repo_id)

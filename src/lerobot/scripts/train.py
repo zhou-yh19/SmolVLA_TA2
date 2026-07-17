@@ -31,6 +31,7 @@ from datetime import timedelta
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.lerobot_dataset import MultiLeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.datasets.utils_must import multidataset_collate_fn
@@ -227,14 +228,14 @@ def train(cfg: TrainPipelineConfig):
         shuffle = True
         sampler = None
     
-    keys_to_max_dim = getattr(dataset.meta, "keys_to_max_dim", {})
-    keys_to_max_dim = {
-    "action": (32,),
-    "observation.state": (32,),
-    "observation.images.image": (3, 1080, 1920),
-    "observation.images.image2": (3, 1080, 1920),
-}
-    collate_fn = partial(multidataset_collate_fn, keys_to_max_dim=keys_to_max_dim)
+    collate_fn = None
+    if isinstance(dataset, MultiLeRobotDataset):
+        keys_to_max_dim = {
+            key: (max_dim,)
+            for key, max_dim in dataset.meta.keys_to_max_dim.items()
+            if max_dim is not None and key in ["action", "observation.state", "observation.environment_state"]
+        }
+        collate_fn = partial(multidataset_collate_fn, keys_to_max_dim=keys_to_max_dim)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         collate_fn=collate_fn,
@@ -244,7 +245,7 @@ def train(cfg: TrainPipelineConfig):
         sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=False,
-    ) # Most important line
+    )
     if accelerator:
         policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler

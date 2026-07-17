@@ -2,6 +2,7 @@
 Utils function by Mustafa to refactor
 """
 
+import logging
 from collections import defaultdict
 from typing import Dict, List
 
@@ -244,10 +245,13 @@ def load_yaml_mapping(name: str) -> dict:
     Example: name='features' → https://huggingface.co/jadechoghari/smolvla-keys/resolve/main/features.yaml
     """
     url = f"https://huggingface.co/jadechoghari/smolvla-keys/resolve/main/{name}.yaml"
-    response = requests.get(url)
-    response.raise_for_status()  # raise if the download fails
-
-    return yaml.safe_load(response.text)
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return yaml.safe_load(response.text) or {}
+    except (requests.RequestException, yaml.YAMLError) as error:
+        logging.warning("Could not load remote %s mapping: %s. Continuing without it.", name, error)
+        return {}
 
 
 # Example usage
