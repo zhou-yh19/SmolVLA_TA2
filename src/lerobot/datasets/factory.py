@@ -107,7 +107,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             revision=revision,
             local_files_only=local_files_only,
         )
-        feature_adapter = get_dataset_adapter(ds_meta.robot_type)
+        feature_adapter = get_dataset_adapter(ds_meta.robot_type, dataset_root=ds_meta.root)
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
@@ -146,7 +146,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             )  # FIXME(mshukor): ?
             delta_timestamps[repo_id[i]] = resolve_delta_timestamps(cfg.policy, ds_meta)
             episodes[repo_id[i]] = EPISODES_DATASET_MAPPING.get(repo_id[i], cfg.dataset.episodes)
-            feature_adapters[repo_id[i]] = get_dataset_adapter(ds_meta.robot_type)
+            feature_adapters[repo_id[i]] = get_dataset_adapter(
+                ds_meta.robot_type, dataset_root=ds_meta.root
+            )
         # training_features = TRAINING_FEATURES.get(cfg.dataset.features_version, None)
         # FIXME: (jadechoghari): check support for training features
         training_features = None

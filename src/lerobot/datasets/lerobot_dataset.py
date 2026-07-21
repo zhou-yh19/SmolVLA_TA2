@@ -662,7 +662,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.feature_adapter is not None:
             self.feature_adapter.adapt_metadata(self.meta)
             if hasattr(self, "stats"):
-                self.stats = self.feature_adapter.project_stats(self.stats)
+                self.stats = self.feature_adapter.project_stats(
+                    self.stats, episode_indices=self.episodes
+                )
         # Override tasks
         self.meta.tasks = TASKS_KEYS_MAPPING.get(self.repo_id, self.meta.tasks)
 
@@ -840,7 +842,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self.meta.video_keys:
+        video_keys = getattr(self.feature_adapter, "source_video_keys", self.meta.video_keys)
+        for key in video_keys:
             if query_indices is not None and key in query_indices:
                 timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
                 query_timestamps[key] = torch.stack(timestamps).tolist()

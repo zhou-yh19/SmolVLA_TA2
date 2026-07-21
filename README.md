@@ -53,6 +53,17 @@ conda env create -f environment.yml
 conda activate vlab
 ```
 
+Alternatively, create the pinned CUDA 12.8 environment with the bundled setup script:
+
+```bash
+bash scripts/setup_vlab_env.sh
+conda activate vlab
+```
+
+The script uses the Tsinghua Conda/PyPI mirrors and installs PyTorch 2.7.1 CUDA
+12.8 wheels. Override `ENV_NAME`, `CONDA_CHANNEL`, `PYPI_INDEX_URL`,
+`PYTORCH_INDEX_URL`, or `PIP_TIMEOUT` as environment variables when needed.
+
 ### Step 2: Set Python Path (IMPORTANT)
 
 ```bash
@@ -117,6 +128,51 @@ This will:
 2. Train SmolVLA2 on a single GPU for 10,000 steps
 3. Save checkpoints to `./outputs/training`
 4. Log metrics to Weights & Biases
+
+## TeleAvatar V2 Training
+
+TeleAvatar V2 datasets produced by `rosbag_to_dataset_TA2` contain 72-dimensional
+state/action vectors and three side-by-side stereo videos. VLAb adapts them to
+the SmolVLA contract at load time:
+
+- state: 14 absolute arm joint positions (`[0:7, 8:15]`)
+- action: 14 absolute arm targets plus gripper efforts at source indices 39 and 47
+- grippers: source effort is converted to the platform's `[0, 1]` trigger space
+- cameras: head, left wrist, and right wrist all use the left stereo eye
+- camera order: head, left wrist, right wrist
+
+The gripper transform is piecewise, so raw LeRobot statistics cannot be sliced
+or reused. Compute adapted statistics once before training (the source dataset is
+not modified):
+
+```bash
+python scripts/compute_teleavatar_v2_stats.py \
+    --dataset /path/to/datasets/teleavatar_v2/my_task
+```
+
+This writes
+`/path/to/datasets/teleavatar_v2/my_task/meta/teleavatar_v2_stats.json`.
+Loading a `robot_type: teleavatar` dataset without this file fails explicitly.
+
+Then train using the dataset path relative to `--dataset.root`:
+
+```bash
+accelerate launch --config_file accelerate_configs/single_gpu.yaml \
+    src/lerobot/scripts/train.py \
+    --policy.type=smolvla2 \
+    --policy.repo_id=HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+    --dataset.repo_id=teleavatar_v2/my_task \
+    --dataset.root=/path/to/datasets \
+    --dataset.video_backend=pyav \
+    --output_dir=./outputs/teleavatar_v2 \
+    --batch_size=8 \
+    --steps=10000
+```
+
+Before a long run, verify one loaded batch has state shape `[B, 14]`, action
+shape `[B, horizon, 16]`, and the three canonical image keys
+`observation.images.image`, `image2`, and `image3`. Deployment must use the same
+all-left-eye camera convention.
 
 
 ## Reproducing SmolVLA Training
