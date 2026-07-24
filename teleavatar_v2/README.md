@@ -74,7 +74,8 @@ queue is used.
 
 4. Use an environment containing ROS2 Humble, PyGObject/GStreamer, PyTorch,
    Transformers, Safetensors, NumPy, and PyYAML. The existing `environment.yml`
-   is the combined robot/inference environment.
+   is the combined robot/inference environment. It is a human-maintained list
+   of direct dependencies, not a machine-specific `conda env export`.
 5. Use the `pretrained_model` directory of a checkpoint. It must contain
    `config.json` and `model.safetensors`.
 6. The configuration and tokenizer/processor named by `vlm_model_name` must
@@ -89,6 +90,34 @@ Create the combined environment on the Linux deployment host with:
 conda env create -n teleavatar-smolvla -f environment.yml
 conda activate teleavatar-smolvla
 ```
+
+The default PyTorch wheels use CUDA 12.8 because RTX 50-series GPUs require
+`sm_120`. After creating or updating the environment, verify that Pip did not
+silently choose another CUDA build:
+
+```bash
+python -m pip check
+python - <<'PY'
+import torch
+
+print("PyTorch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("CUDA architectures:", torch.cuda.get_arch_list())
+print("GPU:", torch.cuda.get_device_name(0))
+print("CUDA smoke test:", torch.randn(1, device="cuda"))
+PY
+```
+
+The expected PyTorch version ends in `+cu128`, and RTX 50-series hosts must
+show `sm_120`. To update an existing environment after editing the file:
+
+```bash
+conda env update -n teleavatar-smolvla -f environment.yml --prune
+```
+
+Do not regenerate `environment.yml` with `conda env export`. If an exact
+machine snapshot is needed for debugging, write it to a separate ignored file,
+for example `conda env export > environment.lock.local.yml`.
 
 ## Bring-up order
 
@@ -140,6 +169,20 @@ python scripts/run_smolvla.py \
   --control-frequency 20 \
   --execution-horizon 16 \
   --max-joint-step-rad 0.10 \
+  --execute
+```
+
+example:
+```bash
+python scripts/run_smolvla.py \
+  --checkpoint /home/new/checkpoint/smol_floor2_test/pretrained_model \
+  --smolvla-repo /home/new/SmolVLA_TA2 \
+  --vlm-model-path /home/new/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467 \
+  --device cuda \
+  --task "Stack the second layer of blocks." \
+  --control-frequency 20 \
+  --execution-horizon 16 \
+  --max-joint-step-rad 0.05 \
   --execute
 ```
 

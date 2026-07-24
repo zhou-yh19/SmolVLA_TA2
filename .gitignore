@@ -72,8 +72,8 @@ videos/
 # Environment variables
 .env
 .env.local
+environment.lock.local.yml
 
 # Large files
 *.zip
 *.tar.gz
-
