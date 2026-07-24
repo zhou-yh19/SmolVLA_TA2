@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+camera_outputs/
+*.mp4
+*.log
