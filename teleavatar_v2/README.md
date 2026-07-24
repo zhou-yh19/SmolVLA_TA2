@@ -77,9 +77,11 @@ queue is used.
    is the combined robot/inference environment.
 5. Use the `pretrained_model` directory of a checkpoint. It must contain
    `config.json` and `model.safetensors`.
-6. The tokenizer/processor named by `vlm_model_name` must already be cached on
-   the deployment host. For an offline host, download it beforehand and pass
-   its directory through `--vlm-model-path`.
+6. The configuration and tokenizer/processor named by `vlm_model_name` must
+   already be cached on the deployment host. For an offline host, copy them
+   beforehand and pass their directory through `--vlm-model-path`. Deployment
+   does not preload the base VLM weight shards: the complete trained policy is
+   restored from the checkpoint's `model.safetensors`.
 
 Create the combined environment on the Linux deployment host with:
 

@@ -52,6 +52,18 @@ class SmolVLARuntime:
             if not local_vlm.is_dir():
                 raise FileNotFoundError(f"Local VLM model directory not found: {local_vlm}")
             config.vlm_model_name = str(local_vlm)
+        # A deployment checkpoint contains the complete SmolVLA policy state.
+        # Loading the base VLM weights here would be redundant because
+        # SmolVLA2Policy.from_pretrained() restores model.safetensors
+        # immediately after constructing the architecture.  It also makes
+        # deployment depend unnecessarily on the base snapshot's weight
+        # shards; only its config, tokenizer, and processors are required.
+        if config.load_vlm_weights:
+            logging.info(
+                "Disabling redundant base-VLM weight preload; restoring the complete policy from %s",
+                checkpoint_path / "model.safetensors",
+            )
+            config.load_vlm_weights = False
         self._validate_config(config)
         self._torch = torch
         self._device = torch.device(device)
