@@ -18,6 +18,7 @@ DATASET_ROOT="${DATASET_ROOT:-/home/bingxing2/home/scx7f0v/LerobotData}"
 COMMUNITY_SUBDIR="${COMMUNITY_SUBDIR:-community_dataset_v2}"
 EXP_NAME="${EXP_NAME:-smolvla_community_v2_run01}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/${EXP_NAME}}"
+POLICY_PATH="${POLICY_PATH:-}"
 
 # Leave DATASET_REPO_IDS empty to discover every LeRobot dataset below
 # ${DATASET_ROOT}/${COMMUNITY_SUBDIR}. repo IDs must be relative to DATASET_ROOT
@@ -38,6 +39,9 @@ EVAL_FREQ="${EVAL_FREQ:--1}"
 USE_AMP="${USE_AMP:-true}"
 
 VLM_MODEL_NAME="${VLM_MODEL_NAME:-HuggingFaceTB/SmolVLM2-500M-Video-Instruct}"
+OPTIMIZER_LR="${OPTIMIZER_LR:-2.5e-5}"
+TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}"
+FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
 WANDB_ENABLED="${WANDB_ENABLED:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-smolvla-community-v2}"
 WANDB_NOTES="${WANDB_NOTES:-SmolVLA2 multi-dataset training on ${COMMUNITY_SUBDIR}}"
@@ -146,12 +150,11 @@ if not torch.cuda.is_available() or actual < expected:
 PY
 
 train_args=(
-    --policy.type=smolvla2
     --policy.vlm_model_name="${VLM_MODEL_NAME}"
-    --policy.load_vlm_weights=true
     --policy.push_to_hub=false
-    --policy.train_expert_only=false
-    --policy.freeze_vision_encoder=false
+    --policy.optimizer_lr="${OPTIMIZER_LR}"
+    --policy.train_expert_only="${TRAIN_EXPERT_ONLY}"
+    --policy.freeze_vision_encoder="${FREEZE_VISION_ENCODER}"
     --dataset.repo_id="${DATASET_REPO_IDS}"
     --dataset.root="${DATASET_ROOT}"
     --dataset.video_backend=pyav
@@ -174,6 +177,20 @@ train_args=(
     --trackio.enable=false
 )
 
+if [[ -n "${POLICY_PATH}" ]]; then
+    train_args+=(
+        --policy.path="${POLICY_PATH}"
+        --policy.load_vlm_weights=false
+    )
+    policy_init="pretrained:${POLICY_PATH}"
+else
+    train_args+=(
+        --policy.type=smolvla2
+        --policy.load_vlm_weights=true
+    )
+    policy_init="scratch:smolvla2"
+fi
+
 if [[ -n "${DATASET_SAMPLING_WEIGHTS}" ]]; then
     train_args+=(--dataset.sampling_weights="${DATASET_SAMPLING_WEIGHTS}")
 fi
@@ -184,6 +201,7 @@ else
 fi
 
 echo "[info] experiment=${EXP_NAME}"
+echo "[info] policy_init=${policy_init} optimizer_lr=${OPTIMIZER_LR} train_expert_only=${TRAIN_EXPERT_ONLY} freeze_vision_encoder=${FREEZE_VISION_ENCODER}"
 echo "[info] dataset_root=${DATASET_ROOT} datasets=${#validated_repo_ids[@]}"
 for i in "${!validated_repo_ids[@]}"; do
     printf '[info] dataset[%d]=%s\n' "${i}" "${validated_repo_ids[i]}"

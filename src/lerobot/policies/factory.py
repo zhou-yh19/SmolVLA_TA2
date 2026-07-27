@@ -27,23 +27,29 @@ from lerobot.datasets.utils import dataset_to_policy_features
 # from lerobot.envs.utils import env_to_policy_features  # Removed - not needed for SmolVLA2 pretraining
 # SmolVLA2-only policy factory - removed all other policies
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config
+from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config, SmolVLAConfig
 
 
 def get_policy_class(name: str) -> PreTrainedPolicy:
     """Get the policy's class and config class given a name (matching the policy class' `name` attribute)."""
-    if name == "smolvla2":
+    if name in {"smolvla", "smolvla2"}:
         from lerobot.policies.smolvla2.modeling_smolvla2 import SmolVLA2Policy
         return SmolVLA2Policy
     else:
-        raise NotImplementedError(f"Policy with name {name} is not implemented. Only SmolVLA2 is supported.")
+        raise NotImplementedError(
+            f"Policy with name {name} is not implemented. Only SmolVLA/SmolVLA2 is supported."
+        )
 
 
 def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     if policy_type == "smolvla2":
         return SmolVLA2Config(**kwargs)
+    elif policy_type == "smolvla":
+        return SmolVLAConfig(**kwargs)
     else:
-        raise ValueError(f"Policy type '{policy_type}' is not available. Only SmolVLA2 is supported.")
+        raise ValueError(
+            f"Policy type '{policy_type}' is not available. Only SmolVLA/SmolVLA2 is supported."
+        )
 
 
 def make_policy(
@@ -94,13 +100,49 @@ def make_policy(
     else:
         kwargs["dataset_stats"] = ds_meta.stats
 
-    cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+    target_output_features = {
+        key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
+    }
+    target_input_features = {
+        key: ft for key, ft in features.items() if key not in target_output_features
+    }
+
+    target_state = next(
+        (feature for feature in target_input_features.values() if feature.type is FeatureType.STATE),
+        None,
+    )
+    target_action = next(iter(target_output_features.values()), None)
+    if target_state is not None and target_state.shape[-1] > cfg.max_state_dim:
+        raise ValueError(
+            f"Target state dimension {target_state.shape[-1]} exceeds max_state_dim={cfg.max_state_dim}."
+        )
+    if target_action is not None and target_action.shape[-1] > cfg.max_action_dim:
+        raise ValueError(
+            f"Target action dimension {target_action.shape[-1]} exceeds max_action_dim={cfg.max_action_dim}."
+        )
+
+    if cfg.pretrained_path:
+        source_state = cfg.robot_state_feature
+        source_action = cfg.action_feature
+        logging.info(
+            "Adapting pretrained policy features to target dataset: "
+            "state=%s->%s, action=%s->%s, cameras=%d->%d",
+            source_state.shape[-1] if source_state is not None else None,
+            target_state.shape[-1] if target_state is not None else None,
+            source_action.shape[-1] if source_action is not None else None,
+            target_action.shape[-1] if target_action is not None else None,
+            len(cfg.image_features),
+            sum(feature.type is FeatureType.VISUAL for feature in target_input_features.values()),
+        )
+
+    cfg.output_features = target_output_features
+    cfg.input_features = target_input_features
     kwargs["config"] = cfg
 
     if cfg.pretrained_path:
         # Load a pretrained policy and override the config if needed (for example, if there are inference-time
         # hyperparameters that we want to vary).
+        logging.info("Initializing policy from pretrained checkpoint: %s", cfg.pretrained_path)
         kwargs["pretrained_name_or_path"] = cfg.pretrained_path
         policy = policy_cls.from_pretrained(**kwargs)
     else:

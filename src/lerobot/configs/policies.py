@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
+import json
 import logging
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Type, TypeVar
@@ -187,4 +189,33 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # something like --policy.path (in addition to --policy.type)
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
+            if cli_overrides:
+                # Draccus cannot combine CLI overrides with a root ChoiceRegistry
+                # discriminator read only from the JSON file. Resolve the concrete
+                # policy class first, then parse the same config without its
+                # discriminator so checkpoint values and CLI overrides are merged.
+                with open(config_file) as source:
+                    config_payload = json.load(source)
+                policy_type = config_payload.pop(draccus.CHOICE_TYPE_KEY, None)
+                if policy_type is None:
+                    raise ValueError(
+                        f"Missing `{draccus.CHOICE_TYPE_KEY}` in pretrained policy config: {config_file}"
+                    )
+                try:
+                    config_class = cls.get_choice_class(policy_type)
+                except KeyError as error:
+                    supported_types = sorted(cls.get_known_choices())
+                    raise ValueError(
+                        f"Unsupported pretrained policy type '{policy_type}'. "
+                        f"Registered types: {supported_types}"
+                    ) from error
+
+                with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as config_without_type:
+                    json.dump(config_payload, config_without_type)
+                    config_without_type.flush()
+                    return draccus.parse(
+                        config_class,
+                        config_without_type.name,
+                        args=cli_overrides,
+                    )
             return draccus.parse(cls, config_file, args=cli_overrides)

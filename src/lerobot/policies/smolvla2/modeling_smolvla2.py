@@ -52,6 +52,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import logging
 import math
 import os
 import random
@@ -144,6 +145,33 @@ def rename_checkpoint_keys(checkpoint: dict, rename_str: str):
     return new_checkpoint
 
 
+def _shared_state_dict_aliases(state_dict: dict[str, torch.Tensor]) -> dict[str, set[str]]:
+    """Return exact state-dict aliases which Safetensors may store only once."""
+    aliases_by_storage: dict[tuple, set[str]] = {}
+    for key, tensor in state_dict.items():
+        try:
+            storage = tensor.untyped_storage()
+            identity = (
+                tensor.device.type,
+                tensor.device.index,
+                storage.data_ptr(),
+                storage.nbytes(),
+                tensor.storage_offset(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+            )
+        except (AttributeError, RuntimeError):
+            continue
+        aliases_by_storage.setdefault(identity, set()).add(key)
+
+    aliases: dict[str, set[str]] = {}
+    for group in aliases_by_storage.values():
+        if len(group) > 1:
+            for key in group:
+                aliases[key] = group - {key}
+    return aliases
+
+
 def load_smolvla(
     model: torch.nn.Module,
     filename: str | os.PathLike,
@@ -157,20 +185,74 @@ def load_smolvla(
     if checkpoint_keys_mapping and "//" in checkpoint_keys_mapping:
         state_dict = rename_checkpoint_keys(state_dict, checkpoint_keys_mapping)
 
-    state_dict, _ = standardise_state_dict(state_dict, set(model.state_dict().keys()))
+    reference_state = model.state_dict()
+    state_dict, _ = standardise_state_dict(state_dict, set(reference_state))
 
-    # HACK(aliberts): to not overwrite normalization parameters as they should come from the dataset
-    norm_keys = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
-    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(norm_keys)}
+    # Normalization must always come from the target dataset. This is the only
+    # intentionally skipped part of a pretrained SmolVLA checkpoint.
+    normalization_prefixes = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
+    state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith(normalization_prefixes)
+    }
 
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-
-    if not all(key.startswith(norm_keys) for key in missing) or unexpected:
-        raise RuntimeError(
-            "SmolVLA %d missing / %d unexpected keys",
-            len(missing),
-            len(unexpected),
+    expected_model_keys = {
+        key for key in reference_state if not key.startswith(normalization_prefixes)
+    }
+    checkpoint_keys = set(state_dict)
+    shared_aliases = _shared_state_dict_aliases(reference_state)
+    missing = sorted(
+        key
+        for key in expected_model_keys - checkpoint_keys
+        if not (shared_aliases.get(key, set()) & checkpoint_keys)
+    )
+    unexpected = sorted(checkpoint_keys - set(reference_state))
+    shape_mismatches = sorted(
+        (
+            key,
+            tuple(state_dict[key].shape),
+            tuple(reference_state[key].shape),
         )
+        for key in checkpoint_keys & set(reference_state)
+        if state_dict[key].shape != reference_state[key].shape
+    )
+
+    if missing or unexpected or shape_mismatches:
+        details = ["Pretrained SmolVLA checkpoint is incompatible with the instantiated policy."]
+        if missing:
+            details.append(f"Missing keys ({len(missing)}): {missing}")
+        if unexpected:
+            details.append(f"Unexpected keys ({len(unexpected)}): {unexpected}")
+        if shape_mismatches:
+            formatted_shapes = [
+                f"{key}: checkpoint={checkpoint_shape}, model={model_shape}"
+                for key, checkpoint_shape, model_shape in shape_mismatches
+            ]
+            details.append(f"Shape mismatches ({len(shape_mismatches)}): {formatted_shapes}")
+        raise RuntimeError("\n".join(details))
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    remaining_missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith(normalization_prefixes)
+        and not (shared_aliases.get(key, set()) & checkpoint_keys)
+    ]
+    if remaining_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint validation changed during loading: "
+            f"missing={remaining_missing}, unexpected={incompatible.unexpected_keys}"
+        )
+
+    loaded_tensors = len(state_dict)
+    loaded_parameters = sum(tensor.numel() for tensor in state_dict.values())
+    logging.info(
+        "Loaded pretrained SmolVLA weights: tensors=%d, parameters=%d, "
+        "missing_non_normalization=0, unexpected=0, shape_mismatches=0",
+        loaded_tensors,
+        loaded_parameters,
+    )
 
     return model
 
@@ -388,7 +470,7 @@ class SmolVLA2Policy(PreTrainedPolicy):
         map_location: str,
         strict: bool,
     ):
-        safetensors.torch.load_model(model, model_file, strict=strict, device=map_location)
+        del strict
         return load_smolvla(
             model,
             model_file,

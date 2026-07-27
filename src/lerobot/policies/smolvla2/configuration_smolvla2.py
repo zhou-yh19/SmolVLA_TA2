@@ -189,3 +189,31 @@ class SmolVLA2Config(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+
+@PreTrainedConfig.register_subclass("smolvla")
+@dataclass
+class SmolVLAConfig(SmolVLA2Config):
+    """Compatibility config for checkpoints produced by the LeRobot SmolVLA implementation.
+
+    VLAb calls the policy ``smolvla2`` while LeRobot checkpoints use ``smolvla``.
+    The model topology is shared, but newer LeRobot configs also contain a few
+    runtime-only fields which are not used by this pretraining-focused repository.
+    Declaring them here keeps checkpoint parsing explicit instead of silently
+    discarding arbitrary unknown fields.
+    """
+
+    use_peft: bool = False
+    rtc_config: dict | None = None
+    compile_model: bool = False
+    compile_mode: str = "max-autotune"
+    pretrained_revision: str | None = None
+    pretrained_path: str | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.use_peft:
+            raise NotImplementedError(
+                "Loading a LeRobot SmolVLA checkpoint with `use_peft=true` is not supported by VLAb. "
+                "Merge the adapter into the base checkpoint before fine-tuning it here."
+            )

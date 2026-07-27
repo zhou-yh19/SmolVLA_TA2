@@ -73,6 +73,11 @@ class TrainPipelineConfig(HubMixin):
     def validate(self):
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
+        if policy_path and self.resume:
+            raise ValueError(
+                "`--policy.path` starts a new fine-tuning run from model weights, whereas `--resume=true` "
+                "restores a previous run including optimizer and scheduler state. They cannot be used together."
+            )
         if policy_path:
             # Only load the policy config
             cli_overrides = parser.get_cli_overrides("policy")

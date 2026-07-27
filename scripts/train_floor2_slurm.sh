@@ -18,6 +18,7 @@ DATASET_ROOT="${DATASET_ROOT:-/home/bingxing2/home/scx7f0v/LerobotData}"
 DATASET_REPO_ID="${DATASET_REPO_ID:-floor2}"
 EXP_NAME="${EXP_NAME:-smolvla_floor2_run01}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/${EXP_NAME}}"
+POLICY_PATH="${POLICY_PATH:-}"
 
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
@@ -31,6 +32,9 @@ EVAL_FREQ="${EVAL_FREQ:--1}"
 USE_AMP="${USE_AMP:-true}"
 
 VLM_MODEL_NAME="${VLM_MODEL_NAME:-HuggingFaceTB/SmolVLM2-500M-Video-Instruct}"
+OPTIMIZER_LR="${OPTIMIZER_LR:-2.5e-5}"
+TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}"
+FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
 WANDB_ENABLED="${WANDB_ENABLED:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-smolvla-floor2}"
 WANDB_NOTES="${WANDB_NOTES:-SmolVLA2 training on ${DATASET_REPO_ID}}"
@@ -115,12 +119,11 @@ if unsupported:
 PY
 
 train_args=(
-    --policy.type=smolvla2
     --policy.vlm_model_name="${VLM_MODEL_NAME}"
-    --policy.load_vlm_weights=true
     --policy.push_to_hub=false
-    --policy.train_expert_only=false
-    --policy.freeze_vision_encoder=false
+    --policy.optimizer_lr="${OPTIMIZER_LR}"
+    --policy.train_expert_only="${TRAIN_EXPERT_ONLY}"
+    --policy.freeze_vision_encoder="${FREEZE_VISION_ENCODER}"
     --dataset.repo_id="${DATASET_REPO_ID}"
     --dataset.root="${DATASET_ROOT}"
     --dataset.video_backend=pyav
@@ -142,6 +145,20 @@ train_args=(
     --trackio.enable=false
 )
 
+if [[ -n "${POLICY_PATH}" ]]; then
+    train_args+=(
+        --policy.path="${POLICY_PATH}"
+        --policy.load_vlm_weights=false
+    )
+    policy_init="pretrained:${POLICY_PATH}"
+else
+    train_args+=(
+        --policy.type=smolvla2
+        --policy.load_vlm_weights=true
+    )
+    policy_init="scratch:smolvla2"
+fi
+
 if [[ "${WANDB_ENABLED}" == "1" ]]; then
     train_args+=(--wandb.enable=true)
 else
@@ -149,6 +166,7 @@ else
 fi
 
 echo "[info] experiment=${EXP_NAME} dataset=${DATASET_DIR}"
+echo "[info] policy_init=${policy_init} optimizer_lr=${OPTIMIZER_LR} train_expert_only=${TRAIN_EXPERT_ONLY} freeze_vision_encoder=${FREEZE_VISION_ENCODER}"
 echo "[info] GPUs=${NUM_PROCESSES} batch_per_gpu=${BATCH_SIZE} global_batch=$((NUM_PROCESSES * BATCH_SIZE))"
 echo "[info] workers_per_process=${NUM_WORKERS} steps=${NUM_TRAIN_STEPS} output=${OUTPUT_DIR}"
 echo "[info] scheduler_warmup_steps=${SCHEDULER_WARMUP_STEPS} scheduler_decay_steps=${SCHEDULER_DECAY_STEPS} scheduler_decay_lr=${SCHEDULER_DECAY_LR}"

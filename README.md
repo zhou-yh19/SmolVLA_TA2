@@ -174,6 +174,48 @@ shape `[B, horizon, 16]`, and the three canonical image keys
 `observation.images.image`, `image2`, and `image3`. Deployment must use the same
 all-left-eye camera convention.
 
+### Fine-tuning from a pretrained SmolVLA checkpoint
+
+Use `--policy.type=smolvla2` to initialize a new policy from the SmolVLM
+backbone. Use the existing `--policy.path` interface instead when starting a
+new fine-tuning run from a complete SmolVLA checkpoint:
+
+```bash
+accelerate launch --config_file accelerate_configs/single_gpu.yaml \
+    src/lerobot/scripts/train.py \
+    --policy.path=lerobot/smolvla_robotwin \
+    --policy.load_vlm_weights=false \
+    --policy.train_expert_only=true \
+    --policy.freeze_vision_encoder=true \
+    --dataset.repo_id=teleavatar_v2/my_task \
+    --dataset.root=/path/to/datasets \
+    --dataset.video_backend=pyav \
+    --output_dir=./outputs/teleavatar_v2_finetune \
+    --batch_size=8 \
+    --steps=80000
+```
+
+`lerobot/smolvla_base`, `lerobot/smolvla_robotwin`, a compatible local
+checkpoint directory, and checkpoints produced by this repository all use the
+same path. Do not pass `--policy.type` together with `--policy.path`.
+Fine-tuning starts a new optimizer and learning-rate schedule; use
+`--resume=true` with a saved `train_config.json` only when restoring an
+interrupted run.
+
+The SLURM launchers expose this existing CLI path as the `POLICY_PATH`
+environment variable:
+
+```bash
+POLICY_PATH=lerobot/smolvla_robotwin \
+TRAIN_EXPERT_ONLY=true \
+FREEZE_VISION_ENCODER=true \
+sbatch scripts/train_floor2_slurm.sh
+```
+
+Checkpoint loading is fail-closed: every non-normalization tensor must exist
+and match the instantiated model shape. Normalization buffers are intentionally
+replaced with statistics from the target dataset.
+
 
 ## Reproducing SmolVLA Training
 
