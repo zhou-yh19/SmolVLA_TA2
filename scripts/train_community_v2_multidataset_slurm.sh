@@ -30,6 +30,9 @@ NUM_PROCESSES="${NUM_PROCESSES:-4}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-80000}"
+SCHEDULER_WARMUP_STEPS="${SCHEDULER_WARMUP_STEPS:-1000}"
+SCHEDULER_DECAY_STEPS="${SCHEDULER_DECAY_STEPS:-${NUM_TRAIN_STEPS}}"
+SCHEDULER_DECAY_LR="${SCHEDULER_DECAY_LR:-0}"
 SAVE_FREQ="${SAVE_FREQ:-10000}"
 EVAL_FREQ="${EVAL_FREQ:--1}"
 USE_AMP="${USE_AMP:-true}"
@@ -147,7 +150,8 @@ train_args=(
     --policy.vlm_model_name="${VLM_MODEL_NAME}"
     --policy.load_vlm_weights=true
     --policy.push_to_hub=false
-    --policy.train_expert_only=true
+    --policy.train_expert_only=false
+    --policy.freeze_vision_encoder=false
     --dataset.repo_id="${DATASET_REPO_IDS}"
     --dataset.root="${DATASET_ROOT}"
     --dataset.video_backend=pyav
@@ -159,6 +163,9 @@ train_args=(
     --batch_size="${BATCH_SIZE}"
     --num_workers="${NUM_WORKERS}"
     --steps="${NUM_TRAIN_STEPS}"
+    --policy.scheduler_warmup_steps="${SCHEDULER_WARMUP_STEPS}"
+    --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS}"
+    --policy.scheduler_decay_lr="${SCHEDULER_DECAY_LR}"
     --save_freq="${SAVE_FREQ}"
     --eval_freq="${EVAL_FREQ}"
     --policy.use_amp="${USE_AMP}"
@@ -183,6 +190,7 @@ for i in "${!validated_repo_ids[@]}"; do
 done
 echo "[info] GPUs=${NUM_PROCESSES} batch_per_gpu=${BATCH_SIZE} global_batch=$((NUM_PROCESSES * BATCH_SIZE))"
 echo "[info] workers_per_process=${NUM_WORKERS} steps=${NUM_TRAIN_STEPS} output=${OUTPUT_DIR}"
+echo "[info] scheduler_warmup_steps=${SCHEDULER_WARMUP_STEPS} scheduler_decay_steps=${SCHEDULER_DECAY_STEPS} scheduler_decay_lr=${SCHEDULER_DECAY_LR}"
 
 accelerate launch \
     --config_file "${PROJECT_ROOT}/accelerate_configs/multi_gpu.yaml" \
