@@ -60,6 +60,7 @@ class SmolVLAPretrainedCompatibilityTest(unittest.TestCase):
         self.assertEqual(config.type, "smolvla")
         self.assertTrue(config.compile_model)
         self.assertEqual(config.pretrained_revision, "test-revision")
+        self.assertTrue(config.state_to_prefix)
 
     def test_training_config_uses_path_as_new_finetuning_initialization(self):
         payload = {

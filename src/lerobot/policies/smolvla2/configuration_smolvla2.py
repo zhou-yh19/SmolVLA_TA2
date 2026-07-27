@@ -209,6 +209,10 @@ class SmolVLAConfig(SmolVLA2Config):
     compile_mode: str = "max-autotune"
     pretrained_revision: str | None = None
     pretrained_path: str | None = None
+    # Official SmolVLA appends the projected robot state to the VLM prefix,
+    # so state_proj outputs the VLM hidden width (960 for SmolVLM2-500M).
+    # SmolVLA2 keeps its existing expert-width state projection by default.
+    state_to_prefix: bool = True
 
     def __post_init__(self):
         super().__post_init__()
