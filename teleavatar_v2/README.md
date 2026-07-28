@@ -192,6 +192,11 @@ controller at the same time, because they publish to the same command topics.
 
 ## Checkpoint checks
 
+Checkpoints fine-tuned from `lerobot/smolvla_base` or
+`lerobot/smolvla_robotwin` retain `type: smolvla`; checkpoints initialized
+with this repository's scratch mode use `type: smolvla2`. The deployment
+runtime accepts both types through the same policy implementation.
+
 Startup fails before commanding the robot unless the checkpoint declares:
 
 - state shape `(14,)`;

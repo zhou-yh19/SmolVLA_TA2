@@ -13,6 +13,23 @@ import numpy as np
 from .contracts import ACTION_DIM, OBS_IMAGE, OBS_IMAGE_2, OBS_IMAGE_3, OBS_STATE, STATE_DIM
 
 
+def load_policy_config(checkpoint_path: str | Path):
+    """Load either repository-native or official SmolVLA checkpoint config."""
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.smolvla2.configuration_smolvla2 import (
+        SmolVLA2Config,
+        SmolVLAConfig,
+    )
+
+    config = PreTrainedConfig.from_pretrained(checkpoint_path)
+    if not isinstance(config, (SmolVLAConfig, SmolVLA2Config)):
+        raise TypeError(
+            "Deployment supports only SmolVLA/SmolVLA2 checkpoints, "
+            f"got policy type '{config.type}'."
+        )
+    return config
+
+
 class SmolVLARuntime:
     """Load one checkpoint and infer complete chunks without an action queue."""
 
@@ -33,8 +50,6 @@ class SmolVLARuntime:
             sys.path.insert(0, str(source))
 
         import torch
-        from lerobot.configs.policies import PreTrainedConfig
-        from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config  # noqa: F401
         from lerobot.policies.smolvla2.modeling_smolvla2 import SmolVLA2Policy
 
         checkpoint_path = Path(checkpoint).expanduser().resolve()
@@ -45,7 +60,7 @@ class SmolVLARuntime:
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {device}")
 
-        config = PreTrainedConfig.from_pretrained(checkpoint_path)
+        config = load_policy_config(checkpoint_path)
         config.device = device
         if vlm_model_path is not None:
             local_vlm = Path(vlm_model_path).expanduser().resolve()

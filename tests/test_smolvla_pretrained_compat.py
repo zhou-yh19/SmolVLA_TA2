@@ -16,6 +16,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config, SmolVLAConfig
 from lerobot.policies.smolvla2.modeling_smolvla2 import load_smolvla
+from teleavatar_v2.smolvla_deploy.policy_runtime import load_policy_config
 
 
 class _Normalizer(nn.Module):
@@ -99,6 +100,18 @@ class SmolVLAPretrainedCompatibilityTest(unittest.TestCase):
         with patch.object(sys, "argv", ["train.py", "--policy.path=checkpoint"]):
             with self.assertRaisesRegex(ValueError, "cannot be used together"):
                 config.validate()
+
+    def test_deployment_loads_official_and_repository_checkpoint_types(self):
+        for policy_type, expected_class in (
+            ("smolvla", SmolVLAConfig),
+            ("smolvla2", SmolVLA2Config),
+        ):
+            with self.subTest(policy_type=policy_type), TemporaryDirectory() as directory:
+                Path(directory, "config.json").write_text(
+                    json.dumps({"type": policy_type, "push_to_hub": False})
+                )
+                config = load_policy_config(directory)
+                self.assertIsInstance(config, expected_class)
 
     def test_peft_checkpoint_fails_with_actionable_error(self):
         payload = {"type": "smolvla", "use_peft": True}

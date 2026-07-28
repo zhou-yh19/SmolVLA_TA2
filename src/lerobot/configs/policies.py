@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
+import importlib
 import json
 import logging
 import os
@@ -160,6 +161,12 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         revision: str | None = None,
         **policy_kwargs,
     ) -> T:
+        # Config parsing is also used directly by deployment/evaluation entry
+        # points which do not necessarily import the training policy factory.
+        # Register the repository's built-in policy configs here so both
+        # `type=smolvla` and `type=smolvla2` are always resolvable.
+        importlib.import_module("lerobot.policies.smolvla2.configuration_smolvla2")
+
         model_id = str(pretrained_name_or_path)
         config_file: str | None = None
         if Path(model_id).is_dir():
