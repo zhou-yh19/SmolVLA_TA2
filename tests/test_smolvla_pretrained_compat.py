@@ -15,7 +15,7 @@ from lerobot.configs.default import DatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config, SmolVLAConfig
-from lerobot.policies.smolvla2.modeling_smolvla2 import load_smolvla
+from lerobot.policies.smolvla2.modeling_smolvla2 import load_smolvla, reduce_action_losses
 from teleavatar_v2.smolvla_deploy.policy_runtime import SmolVLARuntime, load_policy_config
 
 
@@ -172,6 +172,18 @@ class SmolVLAPretrainedCompatibilityTest(unittest.TestCase):
             SmolVLARuntime._validate_normalization_statistics(
                 _TinyPolicy(normalization_value=float("inf"))
             )
+
+    def test_action_loss_ignores_feature_and_timestep_padding(self):
+        losses = torch.ones(1, 3, 32)
+        losses[..., 16:] = 100.0
+        losses[:, 1, :16] = 100.0
+        action_is_pad = torch.tensor([[False, True, False]])
+
+        loss, masked_losses = reduce_action_losses(losses, 16, action_is_pad)
+
+        torch.testing.assert_close(loss, torch.tensor(1.0))
+        self.assertEqual(tuple(masked_losses.shape), (1, 3, 16))
+        torch.testing.assert_close(masked_losses[:, 1], torch.zeros(1, 16))
 
     def test_strict_loader_accepts_omitted_shared_tensor_alias(self):
         target = _TinyTiedPolicy()

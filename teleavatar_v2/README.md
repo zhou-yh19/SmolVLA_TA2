@@ -33,7 +33,7 @@ teleavatar_v2/
 - Cameras: head left eye, left-wrist left eye, right-wrist left eye.
 - Action: 16 absolute controls: left arm 7, left gripper trigger, right arm 7,
   right gripper trigger.
-- Gripper outputs are already trigger values in `[0, 1]` after checkpoint
+- Gripper outputs are continuous trigger values in `[0, 1]` after checkpoint
   unnormalization. They are clipped and published directly. There is no
   trigger/effort round trip.
 - The policy returns a complete action chunk. The runner executes only the

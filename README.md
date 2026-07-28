@@ -137,7 +137,8 @@ the SmolVLA contract at load time:
 
 - state: 14 absolute arm joint positions (`[0:7, 8:15]`)
 - action: 14 absolute arm targets plus gripper efforts at source indices 39 and 47
-- grippers: source effort is converted to the platform's `[0, 1]` trigger space
+- grippers: source effort is converted to the platform's continuous `[0, 1]`
+  trigger space
 - cameras: head, left wrist, and right wrist all use the left stereo eye
 - camera order: head, left wrist, right wrist
 
@@ -153,6 +154,10 @@ python scripts/compute_teleavatar_v2_stats.py \
 This writes
 `/path/to/datasets/teleavatar_v2/my_task/meta/teleavatar_v2_stats.json`.
 Loading a `robot_type: teleavatar` dataset without this file fails explicitly.
+
+State/action statistics are computed on the real 14/16 dimensions before model
+padding. Training pads action vectors to 32 dimensions internally, but the loss
+uses only the first 16 real dimensions and masks episode-boundary timesteps.
 
 Then train using the dataset path relative to `--dataset.root`:
 

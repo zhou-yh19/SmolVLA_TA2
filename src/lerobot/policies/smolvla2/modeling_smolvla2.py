@@ -370,6 +370,35 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
+def reduce_action_losses(
+    losses: Tensor,
+    action_dim: int,
+    actions_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Average loss over real action dimensions and valid episode timesteps only."""
+    if losses.ndim != 3:
+        raise ValueError(f"Expected action losses [B,T,D], got {tuple(losses.shape)}.")
+    if not 0 < action_dim <= losses.shape[-1]:
+        raise ValueError(
+            f"Real action dimension must be in [1, {losses.shape[-1]}], got {action_dim}."
+        )
+
+    real_losses = losses[..., :action_dim]
+    if actions_is_pad is None:
+        return real_losses.mean(), real_losses
+    if tuple(actions_is_pad.shape) != tuple(real_losses.shape[:2]):
+        raise ValueError(
+            "Action timestep padding mask must have shape "
+            f"{tuple(real_losses.shape[:2])}, got {tuple(actions_is_pad.shape)}."
+        )
+
+    valid_mask = (~actions_is_pad.to(device=losses.device, dtype=torch.bool)).unsqueeze(-1)
+    valid_mask = valid_mask.expand_as(real_losses)
+    masked_losses = real_losses.masked_fill(~valid_mask, 0.0)
+    valid_count = valid_mask.sum().clamp_min(1)
+    return masked_losses.sum() / valid_count, masked_losses
+
+
 def normalize(x, min_val, max_val):
     return (x - min_val) / (max_val - min_val)
 
@@ -628,18 +657,11 @@ class SmolVLA2Policy(PreTrainedPolicy):
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         loss_dict["losses_after_forward"] = losses.clone()
 
+        action_dim = self.config.action_feature.shape[0]
+        loss, masked_losses = reduce_action_losses(losses, action_dim, actions_is_pad)
+        loss_dict["losses_after_rm_padding"] = losses[..., :action_dim].clone()
         if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            losses = losses * in_episode_bound.unsqueeze(-1)
-            loss_dict["losses_after_in_ep_bound"] = losses.clone()
-
-        # Remove padding
-        losses = losses[:, :, : self.config.max_action_dim]
-        loss_dict["losses_after_rm_padding"] = losses.clone()
-
-        # For backward pass
-        loss = losses.mean()
-        # For backward pass
+            loss_dict["losses_after_in_ep_bound"] = masked_losses.clone()
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
 
