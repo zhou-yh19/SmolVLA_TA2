@@ -16,22 +16,22 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config, SmolVLAConfig
 from lerobot.policies.smolvla2.modeling_smolvla2 import load_smolvla
-from teleavatar_v2.smolvla_deploy.policy_runtime import load_policy_config
+from teleavatar_v2.smolvla_deploy.policy_runtime import SmolVLARuntime, load_policy_config
 
 
 class _Normalizer(nn.Module):
-    def __init__(self):
+    def __init__(self, value: float = 1.0):
         super().__init__()
-        self.register_buffer("buffer_mean", torch.ones(2))
+        self.register_buffer("buffer_mean", torch.full((2,), value))
 
 
 class _TinyPolicy(nn.Module):
-    def __init__(self):
+    def __init__(self, normalization_value: float = 1.0):
         super().__init__()
         self.model = nn.Linear(2, 2, bias=False)
-        self.normalize_inputs = _Normalizer()
-        self.normalize_targets = _Normalizer()
-        self.unnormalize_outputs = _Normalizer()
+        self.normalize_inputs = _Normalizer(normalization_value)
+        self.normalize_targets = _Normalizer(normalization_value)
+        self.unnormalize_outputs = _Normalizer(normalization_value)
 
 
 class _TinyTiedPolicy(nn.Module):
@@ -138,6 +138,40 @@ class SmolVLAPretrainedCompatibilityTest(unittest.TestCase):
 
         torch.testing.assert_close(target.model.weight, torch.full_like(target.model.weight, 3.0))
         torch.testing.assert_close(target.normalize_inputs.buffer_mean, torch.ones(2))
+
+    def test_deployment_restores_uninitialized_checkpoint_normalization(self):
+        target = _TinyPolicy(normalization_value=float("inf"))
+        checkpoint = {
+            "model.weight": torch.full_like(target.model.weight, 3.0),
+            "normalize_inputs.buffer_mean": torch.full((2,), 2.0),
+            "normalize_targets.buffer_mean": torch.full((2,), 4.0),
+            "unnormalize_outputs.buffer_mean": torch.full((2,), 6.0),
+        }
+
+        with TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory, "model.safetensors")
+            safetensors.torch.save_file(checkpoint, checkpoint_path)
+            load_smolvla(target, checkpoint_path)
+
+        torch.testing.assert_close(target.normalize_inputs.buffer_mean, torch.full((2,), 2.0))
+        torch.testing.assert_close(target.normalize_targets.buffer_mean, torch.full((2,), 4.0))
+        torch.testing.assert_close(target.unnormalize_outputs.buffer_mean, torch.full((2,), 6.0))
+
+    def test_deployment_rejects_checkpoint_without_required_normalization(self):
+        target = _TinyPolicy(normalization_value=float("inf"))
+        checkpoint = {"model.weight": torch.full_like(target.model.weight, 3.0)}
+
+        with TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory, "model.safetensors")
+            safetensors.torch.save_file(checkpoint, checkpoint_path)
+            with self.assertRaisesRegex(RuntimeError, "Missing keys.*normalize_inputs"):
+                load_smolvla(target, checkpoint_path)
+
+    def test_deployment_guard_rejects_nonfinite_normalization(self):
+        with self.assertRaisesRegex(RuntimeError, "infinity or NaN.*normalize_inputs"):
+            SmolVLARuntime._validate_normalization_statistics(
+                _TinyPolicy(normalization_value=float("inf"))
+            )
 
     def test_strict_loader_accepts_omitted_shared_tensor_alias(self):
         target = _TinyTiedPolicy()

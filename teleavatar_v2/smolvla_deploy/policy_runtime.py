@@ -92,6 +92,7 @@ class SmolVLARuntime:
         )
         self.policy.to(self._device)
         self.policy.eval()
+        self._validate_normalization_statistics(self.policy)
         self.chunk_size = int(config.chunk_size)
         logging.info(
             "Loaded SmolVLA: device=%s chunk_size=%d action_dim=%d",
@@ -118,6 +119,26 @@ class SmolVLARuntime:
             raise ValueError("This checkpoint predicts relative actions; absolute TeleAvatar actions are required")
         if config.adapt_to_pi_aloha:
             raise ValueError("adapt_to_pi_aloha must be disabled for TeleAvatar")
+
+    @staticmethod
+    def _validate_normalization_statistics(policy) -> None:
+        prefixes = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
+        invalid = []
+        normalization_tensors = 0
+        for named_tensors in (policy.named_parameters(), policy.named_buffers()):
+            for name, value in named_tensors:
+                if not name.startswith(prefixes) or not value.is_floating_point():
+                    continue
+                normalization_tensors += 1
+                if not value.isfinite().all().item():
+                    invalid.append(name)
+        if invalid:
+            raise RuntimeError(
+                "Checkpoint normalization statistics contain infinity or NaN after loading: "
+                + ", ".join(sorted(invalid))
+            )
+        if normalization_tensors == 0:
+            logging.warning("Policy has no non-identity normalization statistics to validate")
 
     def _make_batch(self, observation: dict, task: str) -> dict:
         torch = self._torch

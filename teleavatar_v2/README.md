@@ -206,6 +206,11 @@ Startup fails before commanding the robot unless the checkpoint declares:
 - absolute actions (`predict_relative_actions == false`);
 - `adapt_to_pi_aloha == false`.
 
+Deployment restores state/action normalization statistics from the same
+`model.safetensors`. Startup fails before connecting to the robot if any
+required statistic is missing, infinite, or NaN. During fine-tuning, finite
+statistics supplied by the target dataset are preserved instead.
+
 The runtime intentionally implements full-chunk inference itself. It does not
 call the repository's currently broken `predict_action_chunk()` path and does
 not use `select_action()`, whose internal queue would conflict with replanning

@@ -188,18 +188,29 @@ def load_smolvla(
     reference_state = model.state_dict()
     state_dict, _ = standardise_state_dict(state_dict, set(reference_state))
 
-    # Normalization must always come from the target dataset. This is the only
-    # intentionally skipped part of a pretrained SmolVLA checkpoint.
     normalization_prefixes = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
+    required_normalization_keys = {
+        key
+        for key, value in reference_state.items()
+        if key.startswith(normalization_prefixes)
+        and value.is_floating_point()
+        and not torch.isfinite(value).all().item()
+    }
+
+    # Fine-tuning constructs the policy with target-dataset statistics, so its
+    # finite normalization tensors must not be overwritten by source-checkpoint
+    # statistics. Inference constructs the policy without dataset statistics;
+    # those tensors are initialized to infinity and must be restored from the
+    # deployment checkpoint.
     state_dict = {
         key: value
         for key, value in state_dict.items()
-        if not key.startswith(normalization_prefixes)
+        if not key.startswith(normalization_prefixes) or key in required_normalization_keys
     }
 
     expected_model_keys = {
         key for key in reference_state if not key.startswith(normalization_prefixes)
-    }
+    } | required_normalization_keys
     checkpoint_keys = set(state_dict)
     shared_aliases = _shared_state_dict_aliases(reference_state)
     missing = sorted(
@@ -249,9 +260,10 @@ def load_smolvla(
     loaded_parameters = sum(tensor.numel() for tensor in state_dict.values())
     logging.info(
         "Loaded pretrained SmolVLA weights: tensors=%d, parameters=%d, "
-        "missing_non_normalization=0, unexpected=0, shape_mismatches=0",
+        "checkpoint_normalization_tensors=%d, missing=0, unexpected=0, shape_mismatches=0",
         loaded_tensors,
         loaded_parameters,
+        len(required_normalization_keys),
     )
 
     return model
