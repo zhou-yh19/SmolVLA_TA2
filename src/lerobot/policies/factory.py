@@ -137,6 +137,11 @@ def make_policy(
 
     cfg.output_features = target_output_features
     cfg.input_features = target_input_features
+    from lerobot.datasets.adapters.teleavatar import TELEAVATAR_STATE_LAYOUT, TELEAVATAR_STATE_NAMES
+
+    state_names = ds_meta.features.get(OBS_STATE, {}).get("names", ())
+    if tuple(state_names or ()) == TELEAVATAR_STATE_NAMES:
+        cfg.teleavatar_state_layout = TELEAVATAR_STATE_LAYOUT
     kwargs["config"] = cfg
 
     if cfg.pretrained_path:

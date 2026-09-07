@@ -50,6 +50,14 @@ class SmolVLA2Config(PreTrainedConfig):
     max_state_dim: int = 32
     max_action_dim: int = 32
 
+    # Real (unpadded) action width of the training data. The dataset rewrites
+    # `action_feature.shape` to `max_action_dim` whenever it pads (always, on the
+    # multi-dataset path), so that shape cannot tell a real dimension from a
+    # zero-padded one. `train.py` recovers the true width from the dataset
+    # metadata and records it here so the loss is averaged over real dimensions
+    # only. `None` means "trust `action_feature.shape`".
+    true_action_dim: int | None = None
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
@@ -125,6 +133,8 @@ class SmolVLA2Config(PreTrainedConfig):
     max_period: float = 4.0
 
     robot_type: str = ""
+    # Recorded in new TA2 checkpoints; None denotes an older or different embodiment.
+    teleavatar_state_layout: str | None = None
 
     self_attn_only_actions: bool = False
 

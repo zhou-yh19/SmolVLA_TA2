@@ -19,7 +19,8 @@
 The source TA2 dataset stores 72-dimensional state and action vectors. SmolVLA
 uses 14 arm joint positions as state and predicts 16 absolute controls: seven
 joint positions and one gripper trigger for each arm. All three stereo cameras
-are cropped to their left eye and mapped to stable SmolVLA camera keys.
+are cropped to their left eye, downscaled to the resolution the robot streams
+at deployment, and mapped to stable SmolVLA camera keys.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 ACTION = "action"
 OBS_STATE = "observation.state"
@@ -58,7 +60,8 @@ TELEAVATAR_JOINT_POSITION_NAMES = (
     "right_gripper_position",
 )
 
-TELEAVATAR_STATE_INDICES = (*range(7), *range(8, 15))
+TELEAVATAR_STATE_LAYOUT = "arms14_gripper_positions2_v1"
+TELEAVATAR_STATE_INDICES = (*range(7), *range(8, 15), 7, 15)
 TELEAVATAR_ACTION_INDICES = (*range(7), 39, *range(8, 15), 47)
 
 TELEAVATAR_STATE_NAMES = tuple(
@@ -116,6 +119,20 @@ TELEAVATAR_IMAGE_KEY_MAPPING = {
     "observation.images.right_color": OBS_IMAGE_3,
 }
 
+# Per-eye (height, width) the deployed robot delivers. The dataset stores the
+# full sensor resolution (head 1920x3840, wrists 800x2560 side-by-side stereo),
+# but at run time the robot composites all six eyes into one 1280x2720 H265
+# RTP stream and `teleavatar_v2/smolvla_deploy/rtp_video_interface.py` crops
+# each eye back out of it, so the policy sees the head at 960x960 and each
+# wrist at 400x640: exactly half the dataset resolution. Training frames are
+# brought to the same size here so the policy's own 512x512 resize sees the
+# same source resolution in both places. `None` keeps the full-resolution crop.
+TELEAVATAR_DEPLOY_IMAGE_HW: dict[str, tuple[int, int]] = {
+    OBS_IMAGE: (960, 960),
+    OBS_IMAGE_2: (400, 640),
+    OBS_IMAGE_3: (400, 640),
+}
+
 
 def gripper_effort_to_trigger(effort: np.ndarray | torch.Tensor):
     """Convert the TA2 gripper effort in Nm to the platform trigger space."""
@@ -130,7 +147,7 @@ def gripper_effort_to_trigger(effort: np.ndarray | torch.Tensor):
 
 
 def adapt_teleavatar_state(state: np.ndarray | torch.Tensor):
-    """Select the 14 left/right arm joint positions from a TA2 state."""
+    """Keep the 14 arm joints, then append measured left/right gripper positions."""
     return state[..., list(TELEAVATAR_STATE_INDICES)]
 
 
@@ -172,6 +189,75 @@ def crop_left_stereo_eye(image: np.ndarray | torch.Tensor):
     raise ValueError(
         f"Could not identify the channel dimension for image shape {tuple(image.shape)}."
     )
+
+
+def _image_layout(image: np.ndarray | torch.Tensor) -> str:
+    """Return "chw" or "hwc" for an image with optional leading batch dims."""
+    if image.ndim < 3:
+        raise ValueError(
+            f"Expected an image with at least 3 dimensions, got {tuple(image.shape)}."
+        )
+    if image.shape[-3] in (1, 3, 4):
+        return "chw"
+    if image.shape[-1] in (1, 3, 4):
+        return "hwc"
+    raise ValueError(
+        f"Could not identify the channel dimension for image shape {tuple(image.shape)}."
+    )
+
+
+def resize_image(image: np.ndarray | torch.Tensor, height: int, width: int):
+    """Resize a single-eye frame to (height, width), matching the deployment feed.
+
+    Accepts the channel-first float tensors LeRobot decodes from video and the
+    channel-last uint8 arrays used by deployment and debugging helpers, with any
+    number of leading batch/time dimensions. Returns the same layout and dtype.
+    An integer reduction (the deployment case is exactly 2x) is a box filter,
+    i.e. each output pixel is the mean of its source block, so no source pixel
+    is dropped; other ratios fall back to antialiased bilinear resampling.
+    Already-matching frames are returned untouched.
+    """
+    layout = _image_layout(image)
+    current_hw = (
+        tuple(image.shape[-2:]) if layout == "chw" else tuple(image.shape[-3:-1])
+    )
+    if current_hw == (height, width):
+        return image
+
+    is_numpy = isinstance(image, np.ndarray)
+    tensor = torch.from_numpy(np.ascontiguousarray(image)) if is_numpy else image
+    if layout == "hwc":
+        tensor = tensor.movedim(-1, -3)
+
+    lead_shape = tensor.shape[:-3]
+    channels = tensor.shape[-3]
+    flat = tensor.reshape(-1, channels, *tensor.shape[-2:])
+    source_dtype = flat.dtype
+    if not flat.is_floating_point():
+        flat = flat.to(torch.float32)
+    source_height, source_width = flat.shape[-2:]
+    integer_reduction = (
+        source_height >= height
+        and source_width >= width
+        and source_height % height == 0
+        and source_width % width == 0
+    )
+    if integer_reduction:
+        resized = F.interpolate(flat, size=(height, width), mode="area")
+    else:
+        resized = F.interpolate(
+            flat, size=(height, width), mode="bilinear", align_corners=False, antialias=True
+        )
+    if not source_dtype.is_floating_point:
+        info = torch.iinfo(source_dtype)
+        resized = resized.round().clamp_(info.min, info.max).to(source_dtype)
+    elif resized.dtype != source_dtype:
+        resized = resized.to(source_dtype)
+    resized = resized.reshape(*lead_shape, channels, height, width)
+
+    if layout == "hwc":
+        resized = resized.movedim(-3, -1)
+    return resized.numpy() if is_numpy else resized.contiguous()
 
 
 def _deserialize_stats(stats: dict) -> dict:
@@ -222,9 +308,13 @@ class TeleavatarV2Adapter:
         dataset_root: str | Path | None = None,
         *,
         adapted_stats: dict | None = None,
+        image_hw: dict[str, tuple[int, int]] | None = TELEAVATAR_DEPLOY_IMAGE_HW,
     ):
         self.dataset_root = Path(dataset_root) if dataset_root is not None else None
         self.adapted_stats = adapted_stats
+        # Target (height, width) per SmolVLA camera key after the left-eye crop.
+        # Defaults to the deployment feed resolution; `None` disables resizing.
+        self.image_hw = dict(image_hw) if image_hw else {}
         if self.adapted_stats is None and self.dataset_root is not None:
             stats_path = self.dataset_root / TELEAVATAR_V2_STATS_PATH
             if stats_path.is_file():
@@ -293,11 +383,13 @@ class TeleavatarV2Adapter:
                 height, width, channels = shape
                 if width >= 2 * height:
                     width //= 2
+                height, width = self.image_hw.get(target_key, (height, width))
                 feature["shape"] = (height, width, channels)
             else:
                 channels, height, width = shape
                 if width >= 2 * height:
                     width //= 2
+                height, width = self.image_hw.get(target_key, (height, width))
                 feature["shape"] = (channels, height, width)
             image_features.append((target_key, feature))
 
@@ -327,7 +419,8 @@ class TeleavatarV2Adapter:
             != TELEAVATAR_STATE_INDICES
         ):
             raise ValueError(
-                "TeleAvatar V2 adapted stats use stale or unexpected state indices."
+                "TeleAvatar V2 adapted stats use stale or unexpected state indices. "
+                "Regenerate them with scripts/compute_teleavatar_v2_stats.py."
             )
         if (
             tuple(self.adapted_stats.get("action_indices", ()))
@@ -427,7 +520,10 @@ class TeleavatarV2Adapter:
                 raise KeyError(
                     f"TeleAvatar V2 sample is missing camera {source_key!r}."
                 )
-            item[target_key] = crop_left_stereo_eye(image)
+            image = crop_left_stereo_eye(image)
+            if target_key in self.image_hw:
+                image = resize_image(image, *self.image_hw[target_key])
+            item[target_key] = image
         return item
 
 

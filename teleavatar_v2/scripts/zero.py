@@ -47,26 +47,28 @@ class JointInterpolator(Node):
         # Pick the target pose for this namespace
         if self.namespace == "right_arm":
             # Right arm target pose
-            self.target_positions = [
-                -0.50,  # r_joint1
-                -0.92,  # r_joint2
-                0.52,  # r_joint3
-                -1.28,    # r_joint4
-                0.32,  # r_joint5
-                0.55, # r_joint6
-                -0.52   # r_joint7
-            ]
+            self.target_positions = [0.0,-1.0,0.5,-1.5,0.0,0.0,0.0]
+            # [
+            #     -0.50,  # r_joint1
+            #     -0.92,  # r_joint2
+            #     0.52,  # r_joint3
+            #     -1.28,    # r_joint4
+            #     0.32,  # r_joint5
+            #     0.55, # r_joint6
+            #     -0.52   # r_joint7
+            # ]
         else:  # left
             # Left arm target pose
-            self.target_positions = [
-                0.41,  # l_joint1
-                1.16,  # l_joint2
-                -0.47,  # l_joint3
-                0.90,    # l_joint4
-                0.23,  # l_joint5
-                -0.15, # l_joint6
-                0.60   # l_joint7
-            ]
+            self.target_positions = [0.0,1.0,-0.5,1.5,0.0,0.0,0.0]
+            # [
+            #     0.41,  # l_joint1
+            #     1.16,  # l_joint2
+            #     -0.47,  # l_joint3
+            #     0.90,    # l_joint4
+            #     0.23,  # l_joint5
+            #     -0.15, # l_joint6
+            #     0.60   # l_joint7
+            # ]
         self.get_logger().info(
             f"Joint interpolator node initialized for {namespace}. Waiting for initial joint states..."
         )

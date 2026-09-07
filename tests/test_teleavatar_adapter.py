@@ -14,14 +14,17 @@ from lerobot.datasets.adapters.teleavatar import (
     OBS_STATE,
     TELEAVATAR_ACTION_INDICES,
     TELEAVATAR_ACTION_NAMES,
+    TELEAVATAR_DEPLOY_IMAGE_HW,
     TELEAVATAR_RAW_FEATURE_NAMES,
     TELEAVATAR_STATE_INDICES,
     TELEAVATAR_STATE_NAMES,
     TeleavatarV2Adapter,
     adapt_teleavatar_action,
+    adapt_teleavatar_state,
     crop_left_stereo_eye,
     get_dataset_adapter,
     gripper_effort_to_trigger,
+    resize_image,
 )
 
 
@@ -44,9 +47,9 @@ def serialize_stats(stats: dict) -> dict:
 
 
 def make_adapted_stats() -> dict:
-    episode_zero = {OBS_STATE: make_stats(14), ACTION: make_stats(16, 100)}
-    episode_one = {OBS_STATE: make_stats(14, 10), ACTION: make_stats(16, 200)}
-    global_stats = {OBS_STATE: make_stats(14, 5), ACTION: make_stats(16, 150)}
+    episode_zero = {OBS_STATE: make_stats(16), ACTION: make_stats(16, 100)}
+    episode_one = {OBS_STATE: make_stats(16, 10), ACTION: make_stats(16, 200)}
+    global_stats = {OBS_STATE: make_stats(16, 5), ACTION: make_stats(16, 150)}
     return {
         "version": 1,
         "camera_eye": "left",
@@ -109,20 +112,21 @@ class TeleavatarV2AdapterTest(unittest.TestCase):
         self.adapter.adapt_metadata(self.metadata)
 
         features = self.metadata.info["features"]
-        self.assertEqual(features[OBS_STATE]["shape"], (14,))
+        self.assertEqual(features[OBS_STATE]["shape"], (16,))
         self.assertEqual(tuple(features[OBS_STATE]["names"]), TELEAVATAR_STATE_NAMES)
         self.assertEqual(features[ACTION]["shape"], (16,))
         self.assertEqual(tuple(features[ACTION]["names"]), TELEAVATAR_ACTION_NAMES)
-        self.assertEqual(features[OBS_IMAGE]["shape"], (1920, 1920, 3))
-        self.assertEqual(features[OBS_IMAGE_2]["shape"], (800, 1280, 3))
-        self.assertEqual(features[OBS_IMAGE_3]["shape"], (800, 1280, 3))
+        # Left-eye crop, then the deployment feed resolution (half the sensor).
+        self.assertEqual(features[OBS_IMAGE]["shape"], (960, 960, 3))
+        self.assertEqual(features[OBS_IMAGE_2]["shape"], (400, 640, 3))
+        self.assertEqual(features[OBS_IMAGE_3]["shape"], (400, 640, 3))
         self.assertEqual(
             [key for key in features if key in (OBS_IMAGE, OBS_IMAGE_2, OBS_IMAGE_3)],
             [OBS_IMAGE, OBS_IMAGE_2, OBS_IMAGE_3],
         )
 
         np.testing.assert_array_equal(
-            self.metadata.stats[OBS_STATE]["mean"], np.arange(14) + 5
+            self.metadata.stats[OBS_STATE]["mean"], np.arange(16) + 5
         )
         np.testing.assert_array_equal(
             self.metadata.stats[ACTION]["mean"], np.arange(16) + 150
@@ -136,7 +140,65 @@ class TeleavatarV2AdapterTest(unittest.TestCase):
             self.metadata.episodes_stats[1][ACTION]["mean"], np.arange(16) + 200
         )
 
+    def test_full_resolution_metadata_when_resizing_is_disabled(self):
+        adapter = TeleavatarV2Adapter(adapted_stats=make_adapted_stats(), image_hw=None)
+        adapter.adapt_metadata(self.metadata)
+        features = self.metadata.info["features"]
+        self.assertEqual(features[OBS_IMAGE]["shape"], (1920, 1920, 3))
+        self.assertEqual(features[OBS_IMAGE_2]["shape"], (800, 1280, 3))
+        self.assertEqual(features[OBS_IMAGE_3]["shape"], (800, 1280, 3))
+
+    def test_adapt_item_matches_deployment_resolution(self):
+        # Full-resolution stereo frames as LeRobot decodes them: CHW float in [0, 1].
+        head = torch.rand(3, 1920, 3840)
+        left = torch.rand(3, 800, 2560)
+        right = torch.rand(3, 800, 2560)
+        item = {
+            OBS_STATE: np.zeros(72, dtype=np.float32),
+            ACTION: np.zeros(72, dtype=np.float32),
+            "observation.images.head_camera": head,
+            "observation.images.left_color": left,
+            "observation.images.right_color": right,
+        }
+
+        adapted = self.adapter.adapt_item(item)
+
+        self.assertEqual(tuple(adapted[OBS_IMAGE].shape), (3, 960, 960))
+        self.assertEqual(tuple(adapted[OBS_IMAGE_2].shape), (3, 400, 640))
+        self.assertEqual(tuple(adapted[OBS_IMAGE_3].shape), (3, 400, 640))
+        self.assertEqual(adapted[OBS_IMAGE].dtype, torch.float32)
+        # Only the left eye contributes: a 2x antialiased reduction of the left
+        # half averages 2x2 source blocks, so it must match avg-pooling the crop.
+        expected_head = torch.nn.functional.avg_pool2d(head[None, ..., :1920], 2)[0]
+        torch.testing.assert_close(adapted[OBS_IMAGE], expected_head, atol=1e-5, rtol=0)
+        expected_left = torch.nn.functional.avg_pool2d(left[None, ..., :1280], 2)[0]
+        torch.testing.assert_close(adapted[OBS_IMAGE_2], expected_left, atol=1e-5, rtol=0)
+        self.assertEqual(
+            {key: tuple(hw) for key, hw in TELEAVATAR_DEPLOY_IMAGE_HW.items()},
+            {OBS_IMAGE: (960, 960), OBS_IMAGE_2: (400, 640), OBS_IMAGE_3: (400, 640)},
+        )
+
+    def test_resize_image_keeps_layout_and_dtype(self):
+        hwc_uint8 = (np.arange(8 * 8 * 3) % 256).astype(np.uint8).reshape(8, 8, 3)
+        resized = resize_image(hwc_uint8, 4, 4)
+        self.assertEqual(resized.shape, (4, 4, 3))
+        self.assertEqual(resized.dtype, np.uint8)
+        expected = np.round(
+            hwc_uint8.astype(np.float32).reshape(4, 2, 4, 2, 3).mean(axis=(1, 3))
+        ).astype(np.uint8)
+        np.testing.assert_array_equal(resized, expected)
+
+        batched_chw = torch.rand(2, 3, 8, 8)
+        resized_batched = resize_image(batched_chw, 4, 4)
+        self.assertEqual(tuple(resized_batched.shape), (2, 3, 4, 4))
+
+        already = torch.zeros(3, 4, 4)
+        self.assertIs(resize_image(already, 4, 4), already)
+
     def test_adapts_state_action_and_all_three_left_eyes(self):
+        self.adapter = TeleavatarV2Adapter(
+            adapted_stats=make_adapted_stats(), image_hw=None
+        )
         raw_state = np.arange(72, dtype=np.float32)
         raw_action = np.zeros((2, 72), dtype=np.float32)
         raw_action[:, :7] = np.arange(7)
@@ -189,6 +251,20 @@ class TeleavatarV2AdapterTest(unittest.TestCase):
         raw_action[47] = -1.6
         adapted = adapt_teleavatar_action(raw_action)
         np.testing.assert_allclose(adapted[[7, 15]], [0.1, 1.0], atol=1e-6)
+
+    def test_state_appends_measured_positions_not_efforts(self):
+        raw = np.arange(2 * 72, dtype=np.float32).reshape(2, 72)
+        raw[:, [39, 47]] = 999
+        expected = raw[:, [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 7, 15]]
+        np.testing.assert_array_equal(adapt_teleavatar_state(raw), expected)
+        torch.testing.assert_close(adapt_teleavatar_state(torch.from_numpy(raw)), torch.from_numpy(expected))
+
+    def test_old_14d_statistics_require_regeneration(self):
+        stats = make_adapted_stats()
+        stats["state_indices"] = [*range(7), *range(8, 15)]
+        adapter = TeleavatarV2Adapter(adapted_stats=stats)
+        with self.assertRaisesRegex(ValueError, "compute_teleavatar_v2_stats.py"):
+            adapter.adapt_metadata(self.metadata)
 
     def test_crop_left_eye_supports_hwc_and_skips_single_eye(self):
         stereo_hwc = np.arange(8 * 16 * 3).reshape(8, 16, 3)

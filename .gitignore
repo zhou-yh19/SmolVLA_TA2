@@ -5,6 +5,10 @@ __pycache__/
 *.so
 .Python
 build/
+weights/
+datasets/
+weights
+datasets
 develop-eggs/
 dist/
 downloads/

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import random
 from pathlib import Path
 from pprint import pformat
 
@@ -70,21 +71,78 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
+def split_train_val_episodes(
+    base_episodes: list[int] | None,
+    total_episodes: int,
+    num_val: int,
+    seed: int,
+    name: str,
+) -> tuple[list[int] | None, list[int]]:
+    """Hold out whole episodes for validation, deterministically.
+
+    The split must be by episode, not by frame: consecutive frames of the same
+    episode are near-duplicates at 30 fps, so a frame-level holdout scores the
+    model on data it has effectively trained on.
+
+    The RNG is seeded from `seed` and `name` (the dataset's repo_id) rather than
+    from the dataset's position in the run, so adding or reordering datasets in a
+    multi-dataset run leaves the holdout of every other dataset untouched.
+
+    Returns `(train_episodes, val_episodes)`. When the holdout is disabled or
+    impossible, `train_episodes` is `base_episodes` unchanged -- including
+    `None`, which means "every episode" -- so training behaves exactly as it did
+    before this option existed.
+    """
+    if num_val <= 0:
+        return base_episodes, []
+
+    all_eps = list(base_episodes) if base_episodes is not None else list(range(total_episodes))
+    # Never give validation more than half of a dataset, and always leave at
+    # least one episode behind to train on.
+    n_val = min(num_val, len(all_eps) // 2)
+    if n_val <= 0:
+        logging.warning(
+            f"Dataset '{name}' has {len(all_eps)} episode(s); too few to hold any out for "
+            "validation. It contributes to training only."
+        )
+        return base_episodes, []
+
+    rng = random.Random(f"{seed}:{name}")
+    val_eps = sorted(rng.sample(all_eps, n_val))
+    val_set = set(val_eps)
+    train_eps = [ep for ep in all_eps if ep not in val_set]
+    return train_eps, val_eps
+
+
+def make_dataset(
+    cfg: TrainPipelineConfig, split: str = "train"
+) -> LeRobotDataset | MultiLeRobotDataset | None:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
         cfg (TrainPipelineConfig): A TrainPipelineConfig config which contains a DatasetConfig and a PreTrainedConfig.
+        split (str): "train" for the episodes to fit on, "val" for the held-out
+            episodes described by `cfg.dataset.val_episodes_per_dataset`.
 
     Raises:
         NotImplementedError: The MultiLeRobotDataset is currently deactivated.
 
     Returns:
-        LeRobotDataset | MultiLeRobotDataset
+        LeRobotDataset | MultiLeRobotDataset, or None for `split="val"` when no
+        episodes were held out.
     """
+    if split not in ("train", "val"):
+        raise ValueError(f"split must be 'train' or 'val', got {split!r}.")
+
+    # Validation must see the images the deployed policy sees, so the random
+    # train-time augmentations are switched off for it.
     image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+        ImageTransforms(cfg.dataset.image_transforms)
+        if cfg.dataset.image_transforms.enable and split == "train"
+        else None
     )
+    num_val_episodes = cfg.dataset.val_episodes_per_dataset
+    val_split_seed = cfg.dataset.val_split_seed
 
     if "," in cfg.dataset.repo_id:
         repo_id = cfg.dataset.repo_id.split(",")
@@ -109,10 +167,21 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         )
         feature_adapter = get_dataset_adapter(ds_meta.robot_type, dataset_root=ds_meta.root)
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        train_episodes, val_episodes = split_train_val_episodes(
+            cfg.dataset.episodes,
+            ds_meta.total_episodes,
+            num_val_episodes,
+            val_split_seed,
+            cfg.dataset.repo_id,
+        )
+        if split == "val":
+            if not val_episodes:
+                return None
+            logging.info(f"Validation holdout for '{cfg.dataset.repo_id}': episodes {val_episodes}")
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
             root=dataset_root,
-            episodes=cfg.dataset.episodes,
+            episodes=val_episodes if split == "val" else train_episodes,
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             revision=revision,
@@ -145,10 +214,31 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 local_files_only=local_files_only,
             )  # FIXME(mshukor): ?
             delta_timestamps[repo_id[i]] = resolve_delta_timestamps(cfg.policy, ds_meta)
-            episodes[repo_id[i]] = EPISODES_DATASET_MAPPING.get(repo_id[i], cfg.dataset.episodes)
+            base_episodes = EPISODES_DATASET_MAPPING.get(repo_id[i], cfg.dataset.episodes)
+            train_episodes, val_episodes = split_train_val_episodes(
+                base_episodes,
+                ds_meta.total_episodes,
+                num_val_episodes,
+                val_split_seed,
+                repo_id[i],
+            )
+            episodes[repo_id[i]] = val_episodes if split == "val" else train_episodes
             feature_adapters[repo_id[i]] = get_dataset_adapter(
                 ds_meta.robot_type, dataset_root=ds_meta.root
             )
+
+        if split == "val":
+            # A dataset too small to give up an episode contributes nothing here.
+            # It has to be dropped rather than passed an empty episode list, and
+            # `sampling_weights` is positional, so it is filtered in lockstep.
+            keep = [i for i in range(len(repo_id)) if episodes[repo_id[i]]]
+            if not keep:
+                return None
+            repo_id = [repo_id[i] for i in keep]
+            if sampling_weights is not None:
+                sampling_weights = [sampling_weights[i] for i in keep]
+            for r in repo_id:
+                logging.info(f"Validation holdout for '{r}': episodes {episodes[r]}")
         # training_features = TRAINING_FEATURES.get(cfg.dataset.features_version, None)
         # FIXME: (jadechoghari): check support for training features
         training_features = None

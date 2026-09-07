@@ -598,6 +598,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.hf_dataset = self.load_hf_dataset()
 
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
+        episode_ids = self.episodes if self.episodes is not None else list(self.meta.episodes)
+        self._episode_id_to_position = {ep_id: position for position, ep_id in enumerate(episode_ids)}
 
         # mustafa code
         if self.discard_first_n_frames > 0:
@@ -816,13 +818,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
             return get_hf_features_from_features(self.features)
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
-        # Bounds check to prevent IndexError when episode_index is out of range
-        if ep_idx >= len(self.episode_data_index["from"]):
-            # Fall back to the last valid episode
-            ep_idx = len(self.episode_data_index["from"]) - 1
-            
-        ep_start = self.episode_data_index["from"][ep_idx]
-        ep_end = self.episode_data_index["to"][ep_idx]
+        # The Parquet episode ID survives filtering; the boundary table is compacted.
+        try:
+            ep_position = self._episode_id_to_position[ep_idx]
+        except KeyError as error:
+            raise ValueError(f"Episode {ep_idx} is not in the loaded dataset") from error
+        ep_start = self.episode_data_index["from"][ep_position]
+        ep_end = self.episode_data_index["to"][ep_position]
+        if not ep_start.item() <= idx < ep_end.item():
+            raise ValueError(f"Frame {idx} is outside loaded episode {ep_idx}")
         query_indices = {
             key: [max(ep_start.item(), min(ep_end.item() - 1, idx + delta)) for delta in delta_idx]
             for key, delta_idx in self.delta_indices.items()

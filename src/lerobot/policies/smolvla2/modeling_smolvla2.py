@@ -370,6 +370,21 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
+def resolved_action_dim(config) -> int:
+    """Real action width to score, preferring the value recorded by training.
+
+    `config.action_feature.shape` follows the dataset, and the dataset rewrites
+    that shape to `max_action_dim` when it pads. On the multi-dataset path that
+    makes it 32 for a 16-DoF robot, so slicing by it keeps the zero padding in
+    the loss average and halves the gradient signal. `true_action_dim` is set
+    from the dataset metadata by `train.py` and is the authority when present.
+    """
+    true_dim = getattr(config, "true_action_dim", None)
+    if true_dim:
+        return true_dim
+    return config.action_feature.shape[0]
+
+
 def reduce_action_losses(
     losses: Tensor,
     action_dim: int,
@@ -655,13 +670,24 @@ class SmolVLA2Policy(PreTrainedPolicy):
         actions_is_pad = batch.get(f"{ACTION}_is_pad")
         loss_dict = {}
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
-        loss_dict["losses_after_forward"] = losses.clone()
 
-        action_dim = self.config.action_feature.shape[0]
-        loss, masked_losses = reduce_action_losses(losses, action_dim, actions_is_pad)
-        loss_dict["losses_after_rm_padding"] = losses[..., :action_dim].clone()
+        action_dim = resolved_action_dim(self.config)
+        loss, _masked_losses = reduce_action_losses(losses, action_dim, actions_is_pad)
+
+        # `train.py` merges this dict straight into the logger payload, and both
+        # the WandB and TrackIO wrappers drop any value that is not an int, float
+        # or str. These diagnostics must therefore be reduced to scalars here or
+        # they are logged nowhere.
+        #
+        # `losses_after_forward` still averages over all `max_action_dim` slots,
+        # including the padded ones the loss ignores; its gap to
+        # `losses_after_rm_padding` is how much that padding dilutes the signal.
+        # A masked mean over the valid timesteps would just be `loss` again, so
+        # the episode-boundary stage is reported as the masked-out fraction.
+        loss_dict["losses_after_forward"] = losses.mean().item()
+        loss_dict["losses_after_rm_padding"] = losses[..., :action_dim].mean().item()
         if actions_is_pad is not None:
-            loss_dict["losses_after_in_ep_bound"] = masked_losses.clone()
+            loss_dict["action_pad_fraction"] = actions_is_pad.float().mean().item()
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
 

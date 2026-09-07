@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import datetime as dt
+import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Type
 
@@ -60,6 +62,13 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Batches consumed by the validation pass that runs alongside each checkpoint,
+    # when `dataset.val_episodes_per_dataset > 0`. The denoising loss costs one
+    # forward per batch. The open-loop action error additionally integrates the
+    # flow for `policy.num_steps` steps, so it is roughly an order of magnitude
+    # more expensive per batch and gets its own, much smaller budget.
+    val_max_batches: int = 50
+    val_action_batches: int = 10
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -210,8 +219,45 @@ class TrainPipelineConfig(HubMixin):
                 ) from e
 
         cli_args = kwargs.pop("cli_args", [])
-        with draccus.config_type("json"):
-            return draccus.parse(cls, config_file, args=cli_args)
+        parse_file = _strip_nonetype_fields(cls, config_file)
+        try:
+            with draccus.config_type("json"):
+                return draccus.parse(cls, parse_file, args=cli_args)
+        finally:
+            if parse_file != config_file:
+                os.unlink(parse_file)
+
+
+def _strip_nonetype_fields(cls: Type["TrainPipelineConfig"], config_file: str) -> str:
+    """Drop saved keys whose dataclass annotation is literally `None`.
+
+    `env` is annotated `None` here because the environment dependency was removed
+    for SmolVLA2 pretraining, so every `train_config.json` this repo writes
+    contains `"env": null`. draccus has no decoder registered for `NoneType` and
+    raises on the way back in, which breaks `--resume` and anything else that
+    reloads a checkpoint's config. The key carries no information -- the field
+    can only ever be `None` -- so removing it lets the dataclass default fill it
+    back in unchanged.
+
+    Returns the original path when there is nothing to strip, so the common case
+    writes no temporary file.
+    """
+    none_fields = {f.name for f in fields(cls) if f.type in (None, type(None), "None")}
+    if not none_fields:
+        return config_file
+
+    with open(config_file) as f:
+        raw = json.load(f)
+    dropped = none_fields & raw.keys()
+    if not dropped:
+        return config_file
+
+    for name in dropped:
+        del raw[name]
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    with tmp as f:
+        json.dump(raw, f)
+    return tmp.name
 
 
 @dataclass(kw_only=True)

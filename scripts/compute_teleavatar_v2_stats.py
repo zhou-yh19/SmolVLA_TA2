@@ -18,7 +18,6 @@ import sys
 import numpy as np
 import pyarrow.parquet as pq
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -205,7 +204,7 @@ def main() -> None:
 
     count = payload["stats"][OBS_STATE]["count"][0]
     print(f"Wrote adapted TA2 statistics for {count} frames to {output_path}")
-    print("state shape: 14; action shape: 16; cameras: head/left/right left eye")
+    print("state shape: 16; action shape: 16; cameras: head/left/right left eye")
 
 
 if __name__ == "__main__":

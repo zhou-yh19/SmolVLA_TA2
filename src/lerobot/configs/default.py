@@ -52,6 +52,17 @@ class DatasetConfig:
     motion_threshold: float = 5e-2
     motion_window_size: int = 10
     motion_buffer: int = 3
+    # Validation holdout, in whole episodes per dataset. Splitting by frame
+    # would leak: at 30 fps a held-out frame is nearly identical to its
+    # neighbours left in training, so the resulting score means nothing.
+    # 0 disables the holdout and leaves the training split byte-for-byte as it
+    # was, so existing runs are unaffected.
+    val_episodes_per_dataset: int = 0
+    # The holdout is drawn deterministically from this seed and the dataset's
+    # repo_id, so it survives restarts and resumes, and adding a dataset to a
+    # multi-dataset run does not reshuffle the holdout of the others. Changing
+    # it invalidates comparisons against earlier runs.
+    val_split_seed: int = 1000
 
 
 @dataclass

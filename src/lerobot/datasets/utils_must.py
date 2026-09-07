@@ -4,6 +4,7 @@ Utils function by Mustafa to refactor
 
 import logging
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -239,11 +240,26 @@ import requests
 import yaml
 
 
+KEYS_CACHE_DIR = Path(__file__).parent / "keys"
+
+
 def load_yaml_mapping(name: str) -> dict:
     """
-    Loads a YAML mapping from a Hugging Face repo.
-    Example: name='features' → https://huggingface.co/jadechoghari/smolvla-keys/resolve/main/features.yaml
+    Loads a YAML mapping, preferring the vendored copy under datasets/keys/.
+
+    Upstream is https://huggingface.co/jadechoghari/smolvla-keys; it is fetched
+    only when the local copy is missing. An empty mapping is not a benign
+    fallback -- it silently disables the per-repo camera renaming and task
+    strings that the community datasets rely on, so training hosts without
+    internet access must get the real thing rather than {}.
     """
+    local_path = KEYS_CACHE_DIR / f"{name}.yaml"
+    if local_path.is_file():
+        try:
+            return yaml.safe_load(local_path.read_text()) or {}
+        except yaml.YAMLError as error:
+            logging.warning("Could not parse %s: %s. Trying the remote copy.", local_path, error)
+
     url = f"https://huggingface.co/jadechoghari/smolvla-keys/resolve/main/{name}.yaml"
     try:
         response = requests.get(url, timeout=10)
@@ -384,6 +400,44 @@ def pad_tensor_to_shape(tensor: torch.Tensor, target_shape: tuple, pad_value: fl
     for actual, target in zip(reversed(tensor.shape), reversed(target_shape), strict=False):
         pad.extend([0, max(target - actual, 0)])
     return F.pad(tensor, pad, value=pad_value)
+
+
+def true_action_dim(dataset, fallback: int) -> int:
+    """Recover a dataset's real action width, before padding to `max_action_dim`.
+
+    `LeRobotDataset.__init__` rewrites `meta.info["features"]["action"]["shape"]`
+    to the padded width, so a 16-DoF arm pair reports 32 and the extra columns
+    are zero on both sides of any comparison -- averaging an error over them
+    halves it. The `names` list survives that rewrite untouched, which makes it
+    the best in-memory record of the true width; `meta/info.json` on disk is the
+    fallback, and `fallback` (normally the padded width) the last resort.
+
+    Accepts either dataset class; `_datasets` is duck-typed rather than imported
+    to keep this module free of a cycle back to `lerobot_dataset`.
+    """
+    import json
+
+    sub_datasets = getattr(dataset, "_datasets", None) or [dataset]
+    dims = []
+    for ds in sub_datasets:
+        try:
+            names = ds.meta.features["action"].get("names")
+        except Exception:
+            names = None
+        if names:
+            dims.append(len(names))
+            continue
+        try:
+            with open(Path(ds.root) / "meta" / "info.json") as f:
+                dims.append(int(json.load(f)["features"]["action"]["shape"][0]))
+        except Exception:
+            logging.warning(
+                f"Could not recover the true action width for '{getattr(ds, 'repo_id', ds)}'; "
+                f"falling back to the padded width {fallback}."
+            )
+    if not dims:
+        return fallback
+    return min(max(dims), fallback)
 
 
 def multidataset_collate_fn(

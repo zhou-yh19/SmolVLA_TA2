@@ -107,7 +107,19 @@ class WandBLogger:
         # Handle custom step key for rl asynchronous training.
         self._wandb_custom_step_key: set[str] | None = None
         print(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
-        logging.info(f"Track this run --> {colored(wandb.run.get_url(), 'yellow', attrs=['bold'])}")
+        # `Run.get_url()` was removed in newer wandb releases in favour of the
+        # `url` property, and an offline run has no URL at all. Report the local
+        # directory in that case instead of failing the whole training run.
+        run_url = getattr(wandb.run, "url", None)
+        if run_url is None:
+            getter = getattr(wandb.run, "get_url", None)
+            run_url = getter() if callable(getter) else None
+        if run_url:
+            logging.info(f"Track this run --> {colored(run_url, 'yellow', attrs=['bold'])}")
+        else:
+            logging.info(
+                f"wandb is offline; metrics are written under {colored(str(self.log_dir), 'yellow', attrs=['bold'])}"
+            )
         self._wandb = wandb
 
     def log_policy(self, checkpoint_dir: Path):

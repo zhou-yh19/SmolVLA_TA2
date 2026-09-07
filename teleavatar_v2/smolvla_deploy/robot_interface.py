@@ -15,7 +15,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32
 
-from .contracts import build_state, map_smolvla_images, split_trigger_action
+from .contracts import build_state, gripper_position, map_smolvla_images, split_trigger_action
 from .rtp_video_interface import RTPH265VideoInterface
 
 
@@ -70,6 +70,18 @@ class TeleavatarSmolVLAInterface(Node):
             lambda msg: self._on_joint_state("right_arm", msg),
             10,
         )
+        self.create_subscription(
+            JointState,
+            "/left_gripper/joint_states",
+            lambda msg: self._on_joint_state("left_gripper", msg),
+            10,
+        )
+        self.create_subscription(
+            JointState,
+            "/right_gripper/joint_states",
+            lambda msg: self._on_joint_state("right_gripper", msg),
+            10,
+        )
         self._arm_publishers = {
             "left_arm": self.create_publisher(JointState, "/api/left_arm/joint_cmd", 10),
             "right_arm": self.create_publisher(JointState, "/api/right_arm/joint_cmd", 10),
@@ -106,7 +118,7 @@ class TeleavatarSmolVLAInterface(Node):
 
         with self._lock:
             stamps = dict(self._joint_timestamps)
-        for arm in ("left_arm", "right_arm"):
+        for arm in ("left_arm", "right_arm", "left_gripper", "right_gripper"):
             stamp = stamps.get(arm)
             if stamp is None:
                 failures.append(f"{arm} not received")
@@ -153,11 +165,17 @@ class TeleavatarSmolVLAInterface(Node):
         with self._lock:
             left_msg = self._joint_states["left_arm"]
             right_msg = self._joint_states["right_arm"]
+            left_gripper_msg = self._joint_states["left_gripper"]
+            right_gripper_msg = self._joint_states["right_gripper"]
         try:
             left = self._ordered_positions(left_msg, self.LEFT_NAMES)
             right = self._ordered_positions(right_msg, self.RIGHT_NAMES)
             return {
-                "observation.state": build_state(left, right),
+                "observation.state": build_state(
+                    left, right,
+                    gripper_position(left_gripper_msg.position),
+                    gripper_position(right_gripper_msg.position),
+                ),
                 **map_smolvla_images(split_images),
             }
         except (KeyError, ValueError) as exc:

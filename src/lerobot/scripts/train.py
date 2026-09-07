@@ -30,15 +30,17 @@ from datetime import timedelta
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.constants import ACTION
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import MultiLeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
-from lerobot.datasets.utils_must import multidataset_collate_fn
+from lerobot.datasets.utils_must import multidataset_collate_fn, true_action_dim
 # from lerobot.envs.factory import make_env  # Removed - not needed for SmolVLA2 pretraining
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.smolvla2.modeling_smolvla2 import resolved_action_dim
 from lerobot.policies.utils import get_device_from_parameters
 # from lerobot.scripts.eval import eval_policy  # Removed - not needed for SmolVLA2 pretraining
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
@@ -62,6 +64,39 @@ from lerobot.utils.trackio_utils import TrackIOLogger
 def is_launched_with_accelerate() -> bool:
     return "ACCELERATE_MIXED_PRECISION" in os.environ
 
+
+def amp_dtype(device_type: str) -> torch.dtype | None:
+    """Autocast dtype for this device, or None to keep torch's own default.
+
+    `torch.autocast` defaults to float16 on CUDA, but the VLM is loaded in
+    bfloat16 (`smolvlm_with_expert2.py`) and the shipped accelerate configs set
+    `mixed_precision: 'no'`, so `accelerator.backward` installs no loss scaler
+    and the `GradScaler` built in `train()` is wired into the single-process
+    branch only. fp16 activations with no scaling anywhere is exactly the
+    combination where small gradients underflow to zero. bfloat16 carries
+    fp32's exponent range, so it needs no scaling and matches the weights
+    already in memory.
+    """
+    if device_type == "cuda":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return None
+
+
+def amp_autocast(device_type: str, use_amp: bool):
+    """AMP context whose dtype matches the weights already in memory."""
+    if not use_amp:
+        return nullcontext()
+    dtype = amp_dtype(device_type)
+    if dtype is None:
+        return torch.autocast(device_type=device_type)
+    return torch.autocast(device_type=device_type, dtype=dtype)
+
+
+def amp_needs_grad_scaler(device_type: str) -> bool:
+    """Only fp16 autocast needs loss scaling; bfloat16 does not."""
+    return amp_dtype(device_type) is torch.float16
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -82,7 +117,7 @@ def update_policy(
 
     if accelerator:
         with accelerator.accumulate(policy):
-            with torch.autocast(device_type=device.type) if use_amp else nullcontext():
+            with amp_autocast(device.type, use_amp):
                 loss, output_dict = policy.forward(batch)
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -95,7 +130,7 @@ def update_policy(
             optimizer.zero_grad()
     else:
         # Standard training loop without accelerate
-        with torch.autocast(device_type=device.type) if use_amp else nullcontext():
+        with amp_autocast(device.type, use_amp):
             loss, output_dict = policy.forward(batch)
         
         grad_scaler.scale(loss).backward()
@@ -124,6 +159,136 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+def run_validation(
+    policy: PreTrainedPolicy,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    max_batches: int,
+    action_batches: int,
+    use_amp: bool,
+    seed: int,
+    action_dim: int | None = None,
+) -> dict[str, float]:
+    """Score the current weights on the held-out episodes.
+
+    Two different questions are answered here, because the cheap metric alone is
+    not enough to act on:
+
+    * `val_loss` is the flow-matching denoising loss on unseen episodes. It is
+      the same quantity as the training loss, so the gap between the two is what
+      says whether the policy is memorising the training episodes.
+    * `val_action_mae*` is the open-loop error of a full 10-step denoising
+      rollout, in physical units, per action dimension. This is the diagnostic
+      that actually maps onto the robot: it says which joint is wrong and by how
+      many radians, and it exposes a gripper dimension that has collapsed to its
+      mean while the averaged loss still looks healthy.
+
+    Neither number predicts closed-loop task success -- behaviour cloning suffers
+    from covariate shift, so a policy can improve on both and still fail on the
+    robot. They bound the problem from one side only: a rising `val_loss` or a
+    stuck `val_action_mae` is real bad news, while good values are necessary
+    rather than sufficient.
+    """
+    was_training = policy.training
+    policy.eval()
+
+    def amp_ctx():
+        return amp_autocast(device.type, use_amp)
+
+    # The policy reports the *padded* action width and the collate function pads
+    # the ground truth to match, so the trailing columns are zero on one side and
+    # unconstrained model output on the other. Averaging over them would roughly
+    # halve every number reported here, hence the caller-supplied true width.
+    if action_dim is None:
+        action_dim = resolved_action_dim(policy.config)
+    max_action_dim = policy.config.max_action_dim
+    chunk_size = policy.config.chunk_size
+
+    loss_sum = 0.0
+    loss_count = 0
+    abs_err_sum = torch.zeros(action_dim, dtype=torch.float64, device=device)
+    abs_err_count = 0.0
+    num_loss_batches = 0
+    num_action_batches = 0
+
+    try:
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                if batch_idx >= max_batches:
+                    break
+
+                for key in batch:
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(device, non_blocking=True)
+
+                gt_actions = batch[ACTION]
+                bsize, horizon = gt_actions.shape[0], gt_actions.shape[1]
+
+                # `SmolVLA2Policy.forward` draws fresh noise and a fresh time on
+                # every call, so an unseeded validation loss moves more between
+                # two calls on identical weights than it does between
+                # checkpoints. Both are drawn here instead, from a CPU generator
+                # seeded by the batch index, so every checkpoint is scored on
+                # exactly the same denoising problem.
+                # `forward` needs one noise vector per ground-truth timestep,
+                # while `sample_actions` needs exactly `chunk_size` of them; the
+                # two agree in this config, but drawing the longer of the two and
+                # slicing keeps them from ever disagreeing silently.
+                generator = torch.Generator().manual_seed(seed + batch_idx)
+                noise = torch.randn(
+                    (bsize, max(horizon, chunk_size), max_action_dim),
+                    generator=generator,
+                    dtype=torch.float32,
+                ).to(device)
+                # One flow-matching time per sample, spread evenly over (0, 1] so
+                # a single batch still covers the whole trajectory rather than a
+                # single noise level. The loader is unshuffled, so `bsize` -- and
+                # therefore this grid -- is identical at every checkpoint.
+                flow_time = ((torch.arange(bsize, dtype=torch.float32) + 0.5) / bsize).to(device)
+
+                with amp_ctx():
+                    loss, _ = policy.forward(batch, noise=noise[:, :horizon], time=flow_time)
+                loss_sum += loss.item() * bsize
+                loss_count += bsize
+                num_loss_batches += 1
+
+                if batch_idx < action_batches:
+                    with amp_ctx():
+                        pred = policy.select_action_chunk(batch, noise=noise[:, :chunk_size])
+                    # `select_action_chunk` unnormalizes its output and
+                    # `batch[ACTION]` was never normalized, so this difference is
+                    # already in radians / gripper units.
+                    steps = min(pred.shape[1], horizon)
+                    err = (
+                        pred[:, :steps, :action_dim].float()
+                        - gt_actions[:, :steps, :action_dim].float()
+                    ).abs()
+                    is_pad = batch.get(f"{ACTION}_is_pad")
+                    if is_pad is None:
+                        valid = torch.ones((bsize, steps, 1), dtype=torch.float32, device=err.device)
+                    else:
+                        valid = (~is_pad[:, :steps].to(torch.bool)).unsqueeze(-1).to(torch.float32)
+                    abs_err_sum += (err * valid).sum(dim=(0, 1)).double()
+                    abs_err_count += valid.sum().item()
+                    num_action_batches += 1
+    finally:
+        if was_training:
+            policy.train()
+
+    metrics: dict[str, float] = {}
+    if loss_count > 0:
+        metrics["val_loss"] = loss_sum / loss_count
+        metrics["val_samples"] = float(loss_count)
+        metrics["val_batches"] = float(num_loss_batches)
+    if abs_err_count > 0:
+        per_dim = (abs_err_sum / abs_err_count).cpu()
+        metrics["val_action_mae"] = per_dim.mean().item()
+        metrics["val_action_batches"] = float(num_action_batches)
+        for d in range(action_dim):
+            metrics[f"val_action_mae_dim{d:02d}"] = per_dim[d].item()
+    return metrics
 
 
 @parser.wrap()
@@ -195,9 +360,32 @@ def train(cfg: TrainPipelineConfig):
         ds_meta=dataset.meta,
     )
 
+    # The dataset pads every action to `max_action_dim` and rewrites the action
+    # feature shape to match, so the policy config alone cannot tell a real
+    # dimension from padding. Recover the real width here, while the dataset is
+    # in scope, so `forward` averages the loss over real dimensions only instead
+    # of diluting it with the always-zero padded slots.
+    train_action_dim = true_action_dim(dataset, policy.config.action_feature.shape[0])
+    policy.config.true_action_dim = train_action_dim
+    if train_action_dim != policy.config.action_feature.shape[0]:
+        logging.info(
+            f"Action feature is padded to {policy.config.action_feature.shape[0]}; "
+            f"training loss is averaged over the first {train_action_dim} real dimensions."
+        )
+
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
-    grad_scaler = GradScaler(device.type, enabled=cfg.policy.use_amp)
+    # A scaler is only meaningful for fp16 autocast; under bfloat16 it would scale
+    # and unscale gradients that were never at risk of underflowing. It stays
+    # unused on the accelerate branch either way.
+    grad_scaler = GradScaler(
+        device.type, enabled=cfg.policy.use_amp and amp_needs_grad_scaler(device.type)
+    )
+    if cfg.policy.use_amp:
+        logging.info(
+            f"AMP enabled: autocast dtype {amp_dtype(device.type) or 'torch default'}, "
+            f"grad scaler enabled={grad_scaler.is_enabled()}"
+        )
 
     step = 0  # number of policy updates (forward + backward + optim)
 
@@ -246,6 +434,46 @@ def train(cfg: TrainPipelineConfig):
         pin_memory=device.type != "cpu",
         drop_last=False,
     )
+    # Validation runs on the main process only, over whole episodes held out of
+    # training, and is deliberately kept out of `accelerator.prepare`: a sharded
+    # loader would make the score depend on the process count, and running a
+    # forward on the DDP wrapper outside the training loop risks a collective
+    # mismatch between ranks. Only the main process builds the dataset at all.
+    validation_enabled = cfg.dataset.val_episodes_per_dataset > 0
+    val_dataloader = None
+    val_action_dim = None
+    if validation_enabled and (accelerator is None or accelerator.is_main_process):
+        val_dataset = make_dataset(cfg, split="val")
+        if val_dataset is None:
+            logging.warning(
+                "val_episodes_per_dataset > 0 but no episodes could be held out; "
+                "validation is disabled for this run."
+            )
+        else:
+            val_action_dim = true_action_dim(val_dataset, train_action_dim)
+            val_collate_fn = None
+            if isinstance(val_dataset, MultiLeRobotDataset):
+                val_keys_to_max_dim = {
+                    key: (max_dim,)
+                    for key, max_dim in val_dataset.meta.keys_to_max_dim.items()
+                    if max_dim is not None
+                    and key in ["action", "observation.state", "observation.environment_state"]
+                }
+                val_collate_fn = partial(multidataset_collate_fn, keys_to_max_dim=val_keys_to_max_dim)
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset,
+                collate_fn=val_collate_fn,
+                num_workers=min(cfg.num_workers, 4),
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                pin_memory=device.type != "cpu",
+                drop_last=False,
+            )
+            logging.info(
+                f"Validation set: {val_dataset.num_frames} frames, "
+                f"{val_dataset.num_episodes} episodes"
+            )
+
     if accelerator:
         policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler
@@ -263,7 +491,8 @@ def train(cfg: TrainPipelineConfig):
     }
 
     train_tracker = MetricsTracker(
-        cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
+        cfg.batch_size * (accelerator.num_processes if accelerator else 1),
+        dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
     )
 
     logging.info("Start offline training on a fixed dataset")
@@ -323,6 +552,43 @@ def train(cfg: TrainPipelineConfig):
                 wandb_logger.log_policy(checkpoint_dir)
             elif trackio_logger:
                 trackio_logger.log_policy(checkpoint_dir)
+
+            if validation_enabled:
+                # The barriers keep the other ranks parked while rank 0 evaluates,
+                # so nobody runs ahead into a collective its peers have not
+                # reached yet.
+                if accelerator:
+                    accelerator.wait_for_everyone()
+                if val_dataloader is not None:
+                    val_start = time.perf_counter()
+                    val_metrics = run_validation(
+                        unwrapped_policy,
+                        val_dataloader,
+                        device,
+                        max_batches=cfg.val_max_batches,
+                        action_batches=cfg.val_action_batches,
+                        use_amp=cfg.policy.use_amp,
+                        seed=cfg.seed if cfg.seed is not None else 0,
+                        action_dim=val_action_dim,
+                    )
+                    val_metrics["val_time_s"] = time.perf_counter() - val_start
+                    logging.info(
+                        f"Validation at step {step}: "
+                        + " ".join(
+                            f"{k}={v:.4f}"
+                            for k, v in val_metrics.items()
+                            if not k.startswith("val_action_mae_dim")
+                        )
+                    )
+                    if wandb_logger:
+                        wandb_logger.log_dict(val_metrics, step, mode="eval")
+                    elif trackio_logger:
+                        trackio_logger.log_dict(val_metrics, step, mode="eval")
+                if accelerator:
+                    accelerator.wait_for_everyone()
+                # `run_validation` put the policy back in train mode, but only on
+                # rank 0; restore it everywhere so the modes cannot drift apart.
+                policy.train()
 
         # Environment evaluation disabled for SmolVLA2 pretraining
         # if cfg.env and is_eval_step:

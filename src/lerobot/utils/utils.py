@@ -117,15 +117,20 @@ def init_logging(log_file: Path | None = None, display_pid: bool = False):
         # NOTE: Display PID is useful for multi-process logging.
         if display_pid:
             pid_str = f"[PID: {os.getpid()}]"
-            message = f"{record.levelname} {pid_str} {dt} {fnameline[-15:]:>15} {record.msg}"
+            message = f"{record.levelname} {pid_str} {dt} {fnameline[-15:]:>15} {record.getMessage()}"
         else:
-            message = f"{record.levelname} {dt} {fnameline[-15:]:>15} {record.msg}"
+            message = f"{record.levelname} {dt} {fnameline[-15:]:>15} {record.getMessage()}"
         return message
-
-    logging.basicConfig(level=logging.INFO)
 
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
+
+    # Set the level explicitly rather than via basicConfig: basicConfig is a
+    # no-op once any handler is attached to the root logger, which is the case
+    # under `accelerate launch` (its import chain installs one). That left the
+    # root level at WARNING and silently dropped every logging.info call,
+    # including the per-step training metrics.
+    logging.root.setLevel(logging.INFO)
 
     formatter = logging.Formatter()
     formatter.format = custom_format

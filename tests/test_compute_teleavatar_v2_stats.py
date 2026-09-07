@@ -72,7 +72,9 @@ class ComputeTeleavatarV2StatsTest(unittest.TestCase):
 
             self.assertEqual(payload["camera_eye"], "left")
             self.assertEqual(payload["stats"][OBS_STATE]["count"], [2])
-            self.assertEqual(len(payload["stats"][OBS_STATE]["mean"]), 14)
+            self.assertEqual(len(payload["stats"][OBS_STATE]["mean"]), 16)
+            np.testing.assert_allclose(payload["stats"][OBS_STATE]["mean"][-2:], [8, 16])
+            np.testing.assert_allclose(payload["stats"][OBS_STATE]["std"][-2:], [1, 1])
             self.assertEqual(len(payload["stats"][ACTION]["mean"]), 16)
             self.assertAlmostEqual(payload["stats"][ACTION]["mean"][7], 0.05, places=6)
             self.assertAlmostEqual(payload["stats"][ACTION]["mean"][15], 0.5, places=6)

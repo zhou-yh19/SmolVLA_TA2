@@ -139,7 +139,11 @@ the SmolVLA contract at load time:
 - action: 14 absolute arm targets plus gripper efforts at source indices 39 and 47
 - grippers: source effort is converted to the platform's continuous `[0, 1]`
   trigger space
-- cameras: head, left wrist, and right wrist all use the left stereo eye
+- cameras: head, left wrist, and right wrist all use the left stereo eye,
+  cropped from the side-by-side stereo videos and then downscaled 2x to the
+  resolution the robot's RTP feed delivers at deployment (head 960x960,
+  wrists 400x640), so training and deployment start the policy's own 512x512
+  resize from the same source resolution
 - camera order: head, left wrist, right wrist
 
 The gripper transform is piecewise, so raw LeRobot statistics cannot be sliced

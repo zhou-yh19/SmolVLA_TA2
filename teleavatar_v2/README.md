@@ -30,7 +30,10 @@ teleavatar_v2/
 ## Runtime contract
 
 - State: 14 absolute arm positions, left 7 followed by right 7.
-- Cameras: head left eye, left-wrist left eye, right-wrist left eye.
+- Cameras: head left eye, left-wrist left eye, right-wrist left eye, as cropped
+  from the 1280x2720 RTP composite (head 960x960, wrists 400x640). Training
+  frames are downscaled to these same sizes, and the runtime warns once per
+  camera if a crop arrives at a different size than the checkpoint was trained at.
 - Action: 16 absolute controls: left arm 7, left gripper trigger, right arm 7,
   right gripper trigger.
 - Gripper outputs are continuous trigger values in `[0, 1]` after checkpoint

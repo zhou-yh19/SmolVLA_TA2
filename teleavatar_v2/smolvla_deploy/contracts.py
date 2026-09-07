@@ -11,7 +11,11 @@ from typing import Mapping
 
 import numpy as np
 
-STATE_DIM = 14
+# The real TeleAvatar widths: seven joints per arm, plus one gripper trigger per
+# arm on the action side. A checkpoint may store them padded; see
+# `resolve_checkpoint_width`.
+STATE_DIM = 16
+STATE_LAYOUT = "arms14_gripper_positions2_v1"
 ACTION_DIM = 16
 
 OBS_STATE = "observation.state"
@@ -37,15 +41,74 @@ class TriggerAction:
     right_trigger: float
 
 
-def build_state(left_positions: np.ndarray, right_positions: np.ndarray) -> np.ndarray:
-    """Build the exact 14-D state used during TeleAvatar SmolVLA training."""
+def resolve_checkpoint_width(name: str, shape, real_dim: int, max_dim: int | None) -> int:
+    """Return the width at which a checkpoint stores a TeleAvatar feature.
+
+    A single-dataset run stores the feature at its real width. A multi-dataset
+    run pads every dataset to the policy's `max_state_dim` / `max_action_dim` so
+    the batch is rectangular, so both the config and the normalization buffers
+    are that wide instead: the TeleAvatar values occupy the leading `real_dim`
+    slots and the rest is zero-mean/unit-std padding. Both are deployable, but
+    the runtime has to feed and slice tensors at whichever width it finds.
+    """
+    width = list(shape)
+    if width == [real_dim]:
+        return real_dim
+    if max_dim is not None and width == [max_dim] and max_dim > real_dim:
+        return max_dim
+    expected = f"[{real_dim}]"
+    if max_dim is not None and max_dim > real_dim:
+        expected += f" or [{max_dim}] (padded)"
+    raise ValueError(f"Checkpoint {name} shape is {width}, expected {expected}")
+
+
+def pad_to_width(vector: np.ndarray, width: int) -> np.ndarray:
+    """Zero-pad a TeleAvatar vector to the width a padded checkpoint expects.
+
+    Training padded with zeros before computing statistics, so the padded slots
+    normalize to exactly zero and contribute nothing.
+    """
+    value = np.asarray(vector, dtype=np.float32)
+    if value.shape[-1] > width:
+        raise ValueError(f"Cannot pad {value.shape[-1]} values down to width {width}")
+    if value.shape[-1] == width:
+        return value
+    padding = np.zeros((*value.shape[:-1], width - value.shape[-1]), dtype=np.float32)
+    return np.concatenate((value, padding), axis=-1, dtype=np.float32)
+
+
+def validate_state_layout(layout: str | None) -> None:
+    if layout != STATE_LAYOUT:
+        raise ValueError(
+            f"Checkpoint state layout {layout!r} is incompatible with {STATE_LAYOUT!r}. "
+            "Use a checkpoint trained with measured gripper positions; older padded "
+            "32-D checkpoints cannot be identified by tensor width alone."
+        )
+
+
+def gripper_position(positions) -> float:
+    """Read the single measured position from a TA2 gripper JointState."""
+    values = np.asarray(positions, dtype=np.float32)
+    if values.shape != (1,) or not np.isfinite(values).all():
+        raise ValueError("Expected one finite measured gripper position")
+    return float(values[0])
+
+
+def build_state(
+    left_positions: np.ndarray, right_positions: np.ndarray,
+    left_gripper_position: float, right_gripper_position: float,
+) -> np.ndarray:
+    """Build [left arm 7, right arm 7, left gripper position, right gripper position]."""
     left = np.asarray(left_positions, dtype=np.float32)
     right = np.asarray(right_positions, dtype=np.float32)
     if left.shape != (7,) or right.shape != (7,):
         raise ValueError(f"Expected two 7-D arm states, got {left.shape} and {right.shape}")
     if not np.isfinite(left).all() or not np.isfinite(right).all():
         raise ValueError("Joint state contains NaN or infinity")
-    return np.concatenate((left, right), dtype=np.float32)
+    grippers = np.asarray([left_gripper_position, right_gripper_position], dtype=np.float32)
+    if grippers.shape != (2,) or not np.isfinite(grippers).all():
+        raise ValueError("Expected two finite scalar gripper positions")
+    return np.concatenate((left, right, grippers), dtype=np.float32)
 
 
 def map_smolvla_images(split_images: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:

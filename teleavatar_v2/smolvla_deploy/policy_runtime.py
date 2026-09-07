@@ -10,7 +10,17 @@ import time
 
 import numpy as np
 
-from .contracts import ACTION_DIM, OBS_IMAGE, OBS_IMAGE_2, OBS_IMAGE_3, OBS_STATE, STATE_DIM
+from .contracts import (
+    ACTION_DIM,
+    OBS_IMAGE,
+    OBS_IMAGE_2,
+    OBS_IMAGE_3,
+    OBS_STATE,
+    STATE_DIM,
+    pad_to_width,
+    resolve_checkpoint_width,
+    validate_state_layout,
+)
 
 
 def load_policy_config(checkpoint_path: str | Path):
@@ -79,10 +89,20 @@ class SmolVLARuntime:
                 checkpoint_path / "model.safetensors",
             )
             config.load_vlm_weights = False
-        self._validate_config(config)
+        self._state_width, self._action_width = self._validate_config(config)
         self._torch = torch
         self._device = torch.device(device)
         self._use_amp = config.use_amp if use_amp is None else bool(use_amp)
+        # (height, width) each camera was trained at, from the checkpoint's
+        # input features (stored channel-first). The training adapter downscales
+        # dataset frames to the RTP feed resolution, so a mismatch here means the
+        # policy's 512x512 resize is starting from a different source than it
+        # saw in training. Reported once per camera rather than per frame.
+        self._trained_image_hw = {
+            key: tuple(int(v) for v in feature.shape[-2:])
+            for key, feature in config.image_features.items()
+        }
+        self._image_hw_warned: set[str] = set()
 
         logging.info("Loading SmolVLA checkpoint from %s", checkpoint_path)
         self.policy = SmolVLA2Policy.from_pretrained(
@@ -95,20 +115,34 @@ class SmolVLARuntime:
         self._validate_normalization_statistics(self.policy)
         self.chunk_size = int(config.chunk_size)
         logging.info(
-            "Loaded SmolVLA: device=%s chunk_size=%d action_dim=%d",
+            "Loaded SmolVLA: device=%s chunk_size=%d action_dim=%d (checkpoint stores state=%d action=%d)",
             self._device,
             self.chunk_size,
             ACTION_DIM,
+            self._state_width,
+            self._action_width,
         )
 
     @staticmethod
-    def _validate_config(config) -> None:
-        if config.action_feature is None or tuple(config.action_feature.shape) != (ACTION_DIM,):
-            shape = None if config.action_feature is None else tuple(config.action_feature.shape)
-            raise ValueError(f"Checkpoint action shape must be ({ACTION_DIM},), got {shape}")
-        if config.robot_state_feature is None or tuple(config.robot_state_feature.shape) != (STATE_DIM,):
-            shape = None if config.robot_state_feature is None else tuple(config.robot_state_feature.shape)
-            raise ValueError(f"Checkpoint state shape must be ({STATE_DIM},), got {shape}")
+    def _validate_config(config) -> tuple[int, int]:
+        """Check the checkpoint contract and return its stored feature widths."""
+        validate_state_layout(getattr(config, "teleavatar_state_layout", None))
+        if config.robot_state_feature is None:
+            raise ValueError("Checkpoint has no observation.state feature")
+        if config.action_feature is None:
+            raise ValueError("Checkpoint has no action feature")
+        state_width = resolve_checkpoint_width(
+            OBS_STATE,
+            config.robot_state_feature.shape,
+            STATE_DIM,
+            getattr(config, "max_state_dim", None),
+        )
+        action_width = resolve_checkpoint_width(
+            "action",
+            config.action_feature.shape,
+            ACTION_DIM,
+            getattr(config, "max_action_dim", None),
+        )
         required_images = {OBS_IMAGE, OBS_IMAGE_2, OBS_IMAGE_3}
         missing = required_images.difference(config.image_features)
         if missing:
@@ -119,6 +153,7 @@ class SmolVLARuntime:
             raise ValueError("This checkpoint predicts relative actions; absolute TeleAvatar actions are required")
         if config.adapt_to_pi_aloha:
             raise ValueError("adapt_to_pi_aloha must be disabled for TeleAvatar")
+        return state_width, action_width
 
     @staticmethod
     def _validate_normalization_statistics(policy) -> None:
@@ -145,6 +180,10 @@ class SmolVLARuntime:
         state = np.asarray(observation[OBS_STATE], dtype=np.float32)
         if state.shape != (STATE_DIM,):
             raise ValueError(f"Expected state ({STATE_DIM},), got {state.shape}")
+        # A checkpoint trained on several datasets normalizes a padded state, so
+        # the buffers are `max_state_dim` wide and a bare 14-D tensor would not
+        # broadcast against them.
+        state = pad_to_width(state, self._state_width)
         batch = {
             OBS_STATE: torch.from_numpy(np.ascontiguousarray(state)).unsqueeze(0).to(self._device),
             "task": task,
@@ -153,6 +192,24 @@ class SmolVLARuntime:
             image = np.asarray(observation[key])
             if image.ndim != 3 or image.shape[-1] != 3:
                 raise ValueError(f"Expected HWC RGB image for {key}, got {image.shape}")
+            trained_hw = self._trained_image_hw.get(key)
+            if (
+                trained_hw is not None
+                and tuple(image.shape[:2]) != trained_hw
+                and key not in self._image_hw_warned
+            ):
+                self._image_hw_warned.add(key)
+                logging.warning(
+                    "%s arrives at %dx%d but the checkpoint was trained at %dx%d; "
+                    "the policy resizes both to 512x512, but the source resolution "
+                    "differs from training (check the RTP split regions or retrain "
+                    "with the matching TELEAVATAR_DEPLOY_IMAGE_HW).",
+                    key,
+                    image.shape[0],
+                    image.shape[1],
+                    trained_hw[0],
+                    trained_hw[1],
+                )
             tensor = torch.from_numpy(np.ascontiguousarray(image))
             tensor = tensor.permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
             batch[key] = tensor.unsqueeze(0).to(self._device)
@@ -180,8 +237,12 @@ class SmolVLARuntime:
                 language_masks,
                 state,
             )
-            actions = actions[:, :, :ACTION_DIM]
+            # `sample_actions` always emits `max_action_dim` columns, so narrow
+            # to whatever width the unnormalize buffers were saved at before
+            # applying them, and only then down to the real TeleAvatar action.
+            actions = actions[:, :, : self._action_width]
             actions = self.policy.unnormalize_outputs({"action": actions})["action"]
+            actions = actions[:, :, :ACTION_DIM]
         elapsed_ms = (time.monotonic() - start) * 1000.0
         chunk = actions[0].detach().to(dtype=torch.float32, device="cpu").numpy()
         if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM or not np.isfinite(chunk).all():

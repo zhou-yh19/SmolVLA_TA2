@@ -13,9 +13,14 @@ from torch import nn
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config, SmolVLAConfig
-from lerobot.policies.smolvla2.modeling_smolvla2 import load_smolvla, reduce_action_losses
+from lerobot.policies.smolvla2.modeling_smolvla2 import (
+    load_smolvla,
+    reduce_action_losses,
+    resolved_action_dim,
+)
 from teleavatar_v2.smolvla_deploy.policy_runtime import SmolVLARuntime, load_policy_config
 
 
@@ -184,6 +189,50 @@ class SmolVLAPretrainedCompatibilityTest(unittest.TestCase):
         torch.testing.assert_close(loss, torch.tensor(1.0))
         self.assertEqual(tuple(masked_losses.shape), (1, 3, 16))
         torch.testing.assert_close(masked_losses[:, 1], torch.zeros(1, 16))
+
+    def test_action_dim_prefers_recorded_width_over_padded_feature_shape(self):
+        # What the multi-dataset path produces: a 16-DoF robot whose action
+        # feature has been rewritten to the padded width.
+        config = SmolVLA2Config()
+        config.output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(32,))}
+
+        self.assertEqual(resolved_action_dim(config), 32)
+
+        config.true_action_dim = 16
+        self.assertEqual(resolved_action_dim(config), 16)
+
+    def test_padded_action_dim_would_halve_the_loss(self):
+        # Perfect predictions on the padded slots, unit error on the real ones.
+        losses = torch.ones(1, 3, 32)
+        losses[..., 16:] = 0.0
+
+        diluted, _ = reduce_action_losses(losses, 32)
+        real, _ = reduce_action_losses(losses, 16)
+
+        torch.testing.assert_close(diluted, torch.tensor(0.5))
+        torch.testing.assert_close(real, torch.tensor(1.0))
+
+    def test_amp_uses_bfloat16_and_no_scaler_when_the_gpu_supports_it(self):
+        from lerobot.scripts.train import amp_dtype, amp_needs_grad_scaler
+
+        with patch("torch.cuda.is_bf16_supported", return_value=True):
+            # bfloat16 matches the dtype the VLM is loaded in and carries fp32's
+            # exponent range, so no loss scaling is needed.
+            self.assertIs(amp_dtype("cuda"), torch.bfloat16)
+            self.assertFalse(amp_needs_grad_scaler("cuda"))
+
+    def test_amp_falls_back_to_scaled_fp16_without_bfloat16_support(self):
+        from lerobot.scripts.train import amp_dtype, amp_needs_grad_scaler
+
+        with patch("torch.cuda.is_bf16_supported", return_value=False):
+            self.assertIs(amp_dtype("cuda"), torch.float16)
+            self.assertTrue(amp_needs_grad_scaler("cuda"))
+
+    def test_amp_never_requests_a_scaler_off_cuda(self):
+        from lerobot.scripts.train import amp_dtype, amp_needs_grad_scaler
+
+        self.assertIsNone(amp_dtype("cpu"))
+        self.assertFalse(amp_needs_grad_scaler("cpu"))
 
     def test_strict_loader_accepts_omitted_shared_tensor_alias(self):
         target = _TinyTiedPolicy()
