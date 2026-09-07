@@ -13,10 +13,23 @@
 # Every value can be overridden from the environment:
 #   DATASET_REPO_IDS=small_lerobot_30fps NUM_TRAIN_STEPS=2000 \
 #       ./scripts/train_small_ta2_local.sh
+#
+# To continue an interrupted run from its newest checkpoint, restoring the
+# optimizer, the scheduler and the step counter:
+#   RESUME=1 ./scripts/train_small_ta2_local.sh
 set -Eeuo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-/home/arapat/disk0/SmolVLA_TA2}"
 CONDA_ENV="${CONDA_ENV:-vlab}"
+
+# wandb and huggingface both default to caches under $HOME. Here $HOME is a
+# 435 GB partition already near capacity while the project sits on a 14 TB
+# volume, so every large cache is redirected onto the project. run06 died at
+# step 6000 because wandb staged a 1.8 GB copy of the checkpoint into
+# ~/.local/share/wandb and $HOME had no room left.
+export WANDB_DATA_DIR="${WANDB_DATA_DIR:-${PROJECT_ROOT}/.wandb_data}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${PROJECT_ROOT}/.wandb_cache}"
+export HF_HOME="${HF_HOME:-${PROJECT_ROOT}/.hf_home}"
 
 # `--dataset.root` is the PARENT directory: make_dataset joins root/repo_id.
 DATASET_ROOT="${DATASET_ROOT:-/DATA/disk0/arapat/SmolVLA_TA2/datasets}"
@@ -35,6 +48,20 @@ DATASET_SAMPLING_WEIGHTS="${DATASET_SAMPLING_WEIGHTS:-}"
 
 EXP_NAME="${EXP_NAME:-smolvla_ta2_multi_run06}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/${EXP_NAME}}"
+
+# RESUME=1 continues an existing run instead of starting a new fine-tune from
+# POLICY_PATH. The difference matters: POLICY_PATH loads weights only and
+# restarts the step counter, the optimizer moments and the LR schedule from
+# zero, whereas --resume=true restores all four, so the run picks up exactly
+# where it stopped. The two are mutually exclusive by design
+# (configs/train.py:85), and this script wires up whichever one applies.
+#
+# RESUME_CHECKPOINT defaults to the `last` symlink that update_last_checkpoint
+# maintains (train.py:549). Override it to rewind to an earlier step:
+#   RESUME=1 RESUME_CHECKPOINT=outputs/<exp>/checkpoints/004000 \
+#       ./scripts/train_small_ta2_local.sh
+RESUME="${RESUME:-1}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-${OUTPUT_DIR}/checkpoints/last}"
 
 # The complete pretrained SmolVLA checkpoint to fine-tune from: backbone AND
 # action expert. Setting it switches the run to --policy.path below.
@@ -122,6 +149,17 @@ USE_AMP="${USE_AMP:-true}"
 WANDB_ENABLED="${WANDB_ENABLED:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-smolvla-ta2}"
 WANDB_MODE="${WANDB_MODE:-offline}"
+# log_policy (wandb_utils.py:134) copies every checkpoint's model.safetensors
+# into wandb's artifact staging directory. Offline runs never upload, so those
+# 1.8 GB copies accumulate until the partition fills; that is what killed run06
+# at step 6000, after the checkpoint itself had already been written. With this
+# at 1, log_policy returns on its first line (wandb_utils.py:127). Set it to 0
+# only when WANDB_MODE=online and the artifacts are actually wanted.
+WANDB_DISABLE_ARTIFACT="${WANDB_DISABLE_ARTIFACT:-1}"
+# Only consulted when RESUME=1, and only as an override: the run id is normally
+# recovered from ${OUTPUT_DIR}/wandb. Set it when several runs share an output
+# directory, or to attach the resumed run to a specific earlier one.
+WANDB_RUN_ID="${WANDB_RUN_ID:-}"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 set +u
@@ -278,7 +316,94 @@ fi
 
 # Same failure mode for the policy checkpoint: an offline run that names a Hub
 # id it cannot fetch dies only after the datasets are built, minutes in.
-if [[ -d "${POLICY_PATH}" ]]; then
+if [[ "${RESUME}" == "1" ]]; then
+    # POLICY_PATH is not consulted at all on a resume, so it is not validated
+    # either. Everything the run needs comes out of the checkpoint: the config
+    # from pretrained_model/, the weights and optimizer state from
+    # training_state/.
+    RESUME_CHECKPOINT="${RESUME_CHECKPOINT%/}"
+    resume_config="${RESUME_CHECKPOINT}/pretrained_model/train_config.json"
+    resume_state="${RESUME_CHECKPOINT}/training_state/training_step.json"
+
+    if [[ ! -f "${resume_config}" ]]; then
+        echo "[error] RESUME=1 but there is no checkpoint config at:" >&2
+        echo "[error]   ${resume_config}" >&2
+        echo "[info] Checkpoints present under ${OUTPUT_DIR}/checkpoints:" >&2
+        find "${OUTPUT_DIR}/checkpoints" -mindepth 1 -maxdepth 1 -print 2>/dev/null \
+            | sort | sed 's|^|  |' >&2
+        echo "[info] Drop RESUME=1 to start a fresh run from POLICY_PATH." >&2
+        exit 6
+    fi
+
+    # A pretrained_model/ without its sibling training_state/ can only be
+    # fine-tuned from step 0 via POLICY_PATH; load_training_state
+    # (train.py:393) needs the optimizer, scheduler and step files.
+    if [[ ! -f "${resume_state}" ]]; then
+        echo "[error] Checkpoint has no training state: ${resume_state}" >&2
+        echo "[error] Resuming needs training_state/ alongside pretrained_model/." >&2
+        echo "[info] To fine-tune from these weights instead, starting the step" >&2
+        echo "[info] counter and the LR schedule over:" >&2
+        echo "  POLICY_PATH=${RESUME_CHECKPOINT}/pretrained_model ./scripts/train_small_ta2_local.sh" >&2
+        exit 6
+    fi
+
+    resume_step="$(python - "${resume_state}" <<'STEP'
+import json, sys
+print(int(json.load(open(sys.argv[1]))["step"]))
+STEP
+)" || { echo "[error] Could not read the step from ${resume_state}" >&2; exit 6; }
+
+    # The training loop runs `for step in range(resume_step, cfg.steps)`, so a
+    # budget at or below the restored step exits immediately after writing one
+    # checkpoint, which reads like a successful run that trained nothing.
+    if (( resume_step >= NUM_TRAIN_STEPS )); then
+        echo "[error] Checkpoint is already at step ${resume_step}, but" >&2
+        echo "[error] NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS}. There is nothing left to run." >&2
+        echo "[info] Raise the budget to continue past it, e.g.:" >&2
+        echo "  RESUME=1 NUM_TRAIN_STEPS=$(( resume_step + 10000 )) ./scripts/train_small_ta2_local.sh" >&2
+        exit 6
+    fi
+
+    echo "[info] resume: ${RESUME_CHECKPOINT}"
+    echo "[info] resume: step ${resume_step} -> ${NUM_TRAIN_STEPS} ($(( NUM_TRAIN_STEPS - resume_step )) steps remaining)"
+
+    # WandBLogger needs the original run id whenever cfg.resume is set: it calls
+    # wandb.init(resume="must"), and when the config carries run_id=null -- which
+    # a checkpoint's train_config.json does -- it falls back to globbing
+    # wandb/latest-run/run-*.wandb (wandb_utils.py:52). That symlink is written
+    # on a clean shutdown, so a crashed run leaves it missing or stale and the
+    # resume dies before the first step. Resolve the id from the run directories
+    # themselves instead, newest first, and pass it explicitly.
+    resume_wandb_run_id="${WANDB_RUN_ID}"
+    if [[ "${WANDB_ENABLED}" == "1" ]]; then
+        wandb_run_files=()
+        if [[ -z "${resume_wandb_run_id}" ]]; then
+            while IFS= read -r wandb_run_file; do
+                [[ -n "${wandb_run_file}" ]] && wandb_run_files+=("${wandb_run_file}")
+            done < <(ls -1t "${OUTPUT_DIR}"/wandb/*/run-*.wandb 2>/dev/null || true)
+
+            if (( ${#wandb_run_files[@]} > 0 )); then
+                resume_wandb_run_id="$(basename "${wandb_run_files[0]}")"
+                resume_wandb_run_id="${resume_wandb_run_id#run-}"
+                resume_wandb_run_id="${resume_wandb_run_id%.wandb}"
+            fi
+        fi
+
+        if [[ -n "${resume_wandb_run_id}" ]]; then
+            echo "[info] resume: wandb run id ${resume_wandb_run_id} (${#wandb_run_files[@]} run dir(s) found)"
+        else
+            # resume="must" cannot succeed without a prior run, so wandb would
+            # abort the whole job over metric logging. Training itself needs
+            # nothing from wandb, and logs/ keeps the full metric stream.
+            echo "[warn] resume: no wandb run found under ${OUTPUT_DIR}/wandb" >&2
+            echo "[warn] resume: wandb is disabled for this run because" >&2
+            echo "[warn] resume: wandb.init(resume=\"must\") needs an existing run." >&2
+            echo "[warn] resume: metrics still go to the log file below." >&2
+            echo "[info] resume: pass WANDB_RUN_ID=<id> to attach to a known run instead." >&2
+            WANDB_ENABLED=0
+        fi
+    fi
+elif [[ -d "${POLICY_PATH}" ]]; then
     for required in config.json model.safetensors; do
         if [[ ! -f "${POLICY_PATH}/${required}" ]]; then
             echo "[error] Policy checkpoint is incomplete: ${POLICY_PATH}" >&2
@@ -402,7 +527,30 @@ train_args=(
     --trackio.enable=false
 )
 
-if [[ -n "${POLICY_PATH}" ]]; then
+if [[ "${RESUME}" == "1" ]]; then
+    # --config_path reloads the whole train config from the checkpoint
+    # (parser.py:220 -> configs/train.py:95), and the arguments assembled above
+    # are applied on top of it as CLI overrides. --policy.path is deliberately
+    # absent: configs/train.py:85 rejects it together with --resume=true,
+    # because the two answer the same question differently.
+    #
+    # Two of the overrides above are inert here. The optimizer's param_groups,
+    # lr included, are restored from the checkpoint (optimizers.py:223), and so
+    # is the scheduler state, so OPTIMIZER_LR and the warmup/decay settings
+    # cannot be changed by a resume -- leave them at the original run's values
+    # to keep the printed summary honest.
+    train_args+=(
+        --config_path="${RESUME_CHECKPOINT}/pretrained_model/train_config.json"
+        --resume=true
+    )
+    # Supplying the id skips get_wandb_run_id_from_filesystem entirely
+    # (wandb_utils.py:82), so the resume no longer depends on the latest-run
+    # symlink surviving the crash that made the resume necessary.
+    if [[ "${WANDB_ENABLED}" == "1" && -n "${resume_wandb_run_id}" ]]; then
+        train_args+=(--wandb.run_id="${resume_wandb_run_id}")
+    fi
+    policy_init="resume:${RESUME_CHECKPOINT}@${resume_step}"
+elif [[ -n "${POLICY_PATH}" ]]; then
     # Fine-tune a complete SmolVLA checkpoint. load_vlm_weights stays false:
     # the backbone arrives with the checkpoint, so re-loading the base SmolVLM
     # shards would overwrite the fine-tuned ones.
@@ -432,6 +580,11 @@ fi
 
 if [[ "${WANDB_ENABLED}" == "1" ]]; then
     train_args+=(--wandb.enable=true)
+    if [[ "${WANDB_DISABLE_ARTIFACT}" == "1" ]]; then
+        train_args+=(--wandb.disable_artifact=true)
+    else
+        train_args+=(--wandb.disable_artifact=false)
+    fi
 else
     train_args+=(--wandb.enable=false)
 fi
@@ -451,7 +604,7 @@ echo "[info] policy_init=${policy_init} optimizer_lr=${OPTIMIZER_LR} train_exper
 echo "[info] GPUs=${NUM_PROCESSES} batch_per_gpu=${BATCH_SIZE} global_batch=${global_batch}"
 echo "[info] workers_per_process=${NUM_WORKERS} steps=${NUM_TRAIN_STEPS} output=${OUTPUT_DIR}"
 echo "[info] scheduler_warmup_steps=${SCHEDULER_WARMUP_STEPS} scheduler_decay_steps=${SCHEDULER_DECAY_STEPS} scheduler_decay_lr=${SCHEDULER_DECAY_LR}"
-echo "[info] wandb_enabled=${WANDB_ENABLED} wandb_mode=${WANDB_MODE}"
+echo "[info] wandb_enabled=${WANDB_ENABLED} wandb_mode=${WANDB_MODE} disable_artifact=${WANDB_DISABLE_ARTIFACT} data_dir=${WANDB_DATA_DIR}"
 if (( VAL_EPISODES_PER_DATASET > 0 )); then
     echo "[info] validation: ${VAL_EPISODES_PER_DATASET} held-out episode(s)/dataset, seed=${VAL_SPLIT_SEED}," \
          "${VAL_MAX_BATCHES} loss batches + ${VAL_ACTION_BATCHES} rollout batches every ${SAVE_FREQ} steps"
