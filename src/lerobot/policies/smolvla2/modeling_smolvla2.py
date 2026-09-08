@@ -880,6 +880,7 @@ class VLAFlowMatching(nn.Module):
             num_vlm_layers=self.config.num_vlm_layers,
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
+            attn_implementation=getattr(self.config, "attn_implementation", "eager"),
         )
         self.vlm_with_expert.configure_peft(config=self.config)
         # Projections are float32
@@ -1059,7 +1060,9 @@ class VLAFlowMatching(nn.Module):
 
     def _add_state_embeddings(self, state, embs, pad_masks, att_masks):
         """Add state embeddings to the lists."""
-        state_emb = self.state_proj(state)
+        # `state` is always fp32; the projection follows the weights, so that the
+        # backbone can be held in bf16 at deployment. A no-op in fp32 training.
+        state_emb = self.state_proj(state.to(dtype=self.state_proj.weight.dtype))
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
 
         bsize, states_seq_len = state_emb.shape[:2]
@@ -1080,7 +1083,7 @@ class VLAFlowMatching(nn.Module):
         att_masks = []
         # Embed state
         if not self.state_to_prefix:
-            state_emb = self.state_proj(state)
+            state_emb = self.state_proj(state.to(dtype=self.state_proj.weight.dtype))
             state_emb = (
                 state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
             )  # .to(dtype=self.vlm_with_expert.type)
@@ -1096,7 +1099,9 @@ class VLAFlowMatching(nn.Module):
             # Set attention masks so that image and language inputs do not attend to state or actions
             att_masks += [1] + [0] * (states_seq_len - 1)
         # Fuse timestep + action information using an MLP
-        action_emb = self.action_in_proj(noisy_actions)
+        # `noisy_actions` stays fp32 across the Euler integration; follow the
+        # projection weights so a bf16 backbone works. A no-op in fp32.
+        action_emb = self.action_in_proj(noisy_actions.to(dtype=self.action_in_proj.weight.dtype))
         device = action_emb.device
         bsize = action_emb.shape[0]
         dtype = action_emb.dtype
@@ -1204,13 +1209,23 @@ class VLAFlowMatching(nn.Module):
                 expanded_time,
             )
         else:
-            dt = -1.0 / self.config.num_steps
-            dt = torch.tensor(dt, dtype=torch.float32, device=device)
+            # Keep the Euler schedule on the host. When `dt` and `time` were CUDA
+            # scalars, evaluating the `while` condition below forced a device
+            # synchronization on every step, so the launch queue drained once per
+            # denoise step and the expert's kernel-launch overhead was fully
+            # exposed instead of being overlapped with the previous step.
+            #
+            # `time` stays a float32 tensor and `dt` is rounded to float32 so the
+            # accumulation below rounds exactly as it did on the device; only the
+            # device changes. Accumulating in Python's float64 instead would shift
+            # the timesteps by an ulp, which is small but not nothing: the
+            # velocity field is evaluated at a different point at every step.
+            dt = float(torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32))
 
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        time = torch.tensor(1.0, dtype=torch.float32)
         while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+            expanded_time = torch.full((bsize,), float(time), dtype=torch.float32, device=device)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -1255,6 +1270,8 @@ class VLAFlowMatching(nn.Module):
         )
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        return v_t
+        # Project in the weights' dtype, then hand the velocity back in fp32 so
+        # the Euler integration in `sample_actions` stays fp32 even when the
+        # backbone is held in bf16. Both casts are no-ops in an fp32 policy.
+        v_t = self.action_out_proj(suffix_out.to(dtype=self.action_out_proj.weight.dtype))
+        return v_t.to(dtype=torch.float32)

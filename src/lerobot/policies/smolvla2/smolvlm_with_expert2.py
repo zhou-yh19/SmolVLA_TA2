@@ -72,6 +72,7 @@ class SmolVLMWithExpertModel(nn.Module):
         num_vlm_layers: int = -1,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
+        attn_implementation: str = "eager",
     ):
         super().__init__()
         if load_vlm_weights:
@@ -145,6 +146,9 @@ class SmolVLMWithExpertModel(nn.Module):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
+        if attn_implementation not in ("eager", "sdpa"):
+            raise ValueError(f"attn_implementation must be 'eager' or 'sdpa', got '{attn_implementation}'")
+        self.attn_implementation = attn_implementation
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
 
@@ -383,6 +387,7 @@ class SmolVLMWithExpertModel(nn.Module):
         if use_cache and past_key_values is None:
             past_key_values = {}
 
+        cache_entry = None
         if use_cache:
             if fill_kv_cache:
                 past_key_values[layer_idx] = {
@@ -390,8 +395,9 @@ class SmolVLMWithExpertModel(nn.Module):
                     "value_states": value_states,
                 }
             else:
-                key_states = past_key_values[layer_idx]["key_states"]
-                value_states = past_key_values[layer_idx]["value_states"]
+                cache_entry = past_key_values[layer_idx]
+                key_states = cache_entry["key_states"]
+                value_states = cache_entry["value_states"]
 
         # Expert
         expert_layer = model_layers[1][layer_idx]
@@ -404,19 +410,31 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
             expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
 
-            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
-                *key_states.shape[:2], -1
-            )
-            expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
-                *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
-            )  # k_proj should have same dim as kv
+            # The prefix K/V read back from the cache is byte-identical on every
+            # denoise step, so its expert-side projection is too. Deriving it
+            # once per chunk instead of once per step removes `num_steps - 1`
+            # passes of two Linears over the full prefix, in every cross-attn
+            # layer. Nothing is cached when `use_cache` is off, so training is
+            # unaffected.
+            cached_expert_kv = None if cache_entry is None else cache_entry.get("expert_kv")
+            if cached_expert_kv is not None:
+                expert_key_states, expert_value_states = cached_expert_kv
+            else:
+                _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
+                    *key_states.shape[:2], -1
+                )
+                expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
+                    *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
+                )  # k_proj should have same dim as kv
 
-            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
-                *value_states.shape[:2], -1
-            )
-            expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
-                *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
-            )
+                _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
+                    *value_states.shape[:2], -1
+                )
+                expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
+                    *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
+                )
+                if cache_entry is not None:
+                    cache_entry["expert_kv"] = (expert_key_states, expert_value_states)
 
             expert_position_id = (
                 expert_position_id - torch.min(expert_position_id, dim=1, keepdim=True).values
@@ -551,8 +569,69 @@ class SmolVLMWithExpertModel(nn.Module):
         return outputs_embeds, past_key_values
 
     def get_attention_interface(self):
-        attention_interface = self.eager_attention_forward
-        return attention_interface
+        if self.attn_implementation == "sdpa":
+            return self.sdpa_attention_forward
+        return self.eager_attention_forward
+
+    def _repeat_kv(self, states, batch_size, head_dim):
+        """Expand grouped-query KV heads to the full query head count."""
+        num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+        if num_key_value_groups == 1:
+            return states
+        sequence_length = states.shape[1]
+        states = states[:, :, :, None, :].expand(
+            batch_size, sequence_length, self.num_key_value_heads, num_key_value_groups, head_dim
+        )
+        return states.reshape(batch_size, sequence_length, self.num_attention_heads, head_dim)
+
+    def sdpa_attention_forward(
+        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
+    ):
+        """Same attention as `eager_attention_forward`, through a fused kernel.
+
+        Two deliberate differences from the eager path:
+        * the [B, H, Lq, Lk] score matrix is never materialized, and neither is
+          the fp32 copy of it that `torch.where` produces there;
+        * the additive mask uses `finfo.min` rather than `-inf`, matching eager's
+          `big_neg`. A fully masked row therefore still yields a (meaningless but
+          finite) uniform distribution instead of NaN, which is what the padded
+          prefix rows rely on.
+        """
+        key_states = self._repeat_kv(key_states, batch_size, head_dim)
+        value_states = self._repeat_kv(value_states, batch_size, head_dim)
+
+        # Q, K and V do not necessarily share a dtype. The VLM and the expert
+        # body are built in the base config's bfloat16, while the cross-attn
+        # k_proj/v_proj replaced in __init__ and the projections added by
+        # VLAFlowMatching are created in torch's fp32 default. The eager path
+        # hides this by upcasting; SDPA requires one dtype, so promote to the
+        # widest of the three - bf16 when the caller has unified the policy,
+        # fp32 for a mixed checkpoint, which is what eager computed in anyway.
+        dtype = torch.promote_types(
+            torch.promote_types(query_states.dtype, key_states.dtype), value_states.dtype
+        )
+
+        # B,L,H,D -> B,H,L,D as expected by scaled_dot_product_attention.
+        query_states = query_states.to(dtype).transpose(1, 2)
+        key_states = key_states.to(dtype).transpose(1, 2)
+        value_states = value_states.to(dtype).transpose(1, 2)
+
+        attn_bias = torch.zeros(
+            attention_mask.shape, dtype=query_states.dtype, device=query_states.device
+        ).masked_fill_(~attention_mask.bool(), torch.finfo(query_states.dtype).min)
+
+        att_output = nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attn_bias[:, None, :, :],
+            dropout_p=0.0,
+            scale=head_dim**-0.5,
+        )
+
+        att_output = att_output.transpose(1, 2)
+        # we use -1 because sequence length can change
+        return att_output.reshape(batch_size, -1, self.num_attention_heads * head_dim)
 
     def eager_attention_forward(
         self, attention_mask, batch_size, head_dim, query_states, key_states, value_states

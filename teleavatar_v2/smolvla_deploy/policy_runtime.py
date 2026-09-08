@@ -50,7 +50,12 @@ class SmolVLARuntime:
         smolvla_repo: str | Path,
         device: str = "cuda",
         use_amp: bool | None = None,
+        num_steps: int | None = None,
+        profile_inference: bool = False,
         vlm_model_path: str | Path | None = None,
+        precision: str | None = None,
+        attn_implementation: str = "sdpa",
+        compile_model: bool = False,
     ) -> None:
         repo = Path(smolvla_repo).expanduser().resolve()
         source = repo / "src"
@@ -72,6 +77,17 @@ class SmolVLARuntime:
 
         config = load_policy_config(checkpoint_path)
         config.device = device
+        if num_steps is not None:
+            if num_steps <= 0:
+                raise ValueError("num_steps must be positive")
+            logging.info("Overriding flow denoising steps: %d -> %d", config.num_steps, num_steps)
+            config.num_steps = int(num_steps)
+        # The hand-rolled attention in `smolvlm_with_expert2` defaults to an eager
+        # kernel that materializes the full [B, H, Lq, Lk] score matrix in fp32.
+        # Training keeps that for reproducibility; deployment has no such reason.
+        if attn_implementation not in ("eager", "sdpa"):
+            raise ValueError(f"attn-implementation must be 'eager' or 'sdpa', got '{attn_implementation}'")
+        config.attn_implementation = attn_implementation
         if vlm_model_path is not None:
             local_vlm = Path(vlm_model_path).expanduser().resolve()
             if not local_vlm.is_dir():
@@ -93,6 +109,18 @@ class SmolVLARuntime:
         self._torch = torch
         self._device = torch.device(device)
         self._use_amp = config.use_amp if use_amp is None else bool(use_amp)
+        self._profile_inference = bool(profile_inference)
+        self._compute_dtype = self._resolve_precision(torch, precision, self._device)
+        if self._compute_dtype is not None and self._use_amp:
+            # Holding the weights in a narrow dtype already gives what autocast
+            # was for, and autocast on top would re-cast every fp32 weight it
+            # sees on each Linear call.
+            logging.info("Disabling autocast: the backbone already runs in %s", self._compute_dtype)
+            self._use_amp = False
+        self._language_cache: dict[tuple[str, int, str], tuple[object, object]] = {}
+        if self._device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         # (height, width) each camera was trained at, from the checkpoint's
         # input features (stored channel-first). The training adapter downscales
         # dataset frames to the RTP feed resolution, so a mismatch here means the
@@ -112,16 +140,100 @@ class SmolVLARuntime:
         )
         self.policy.to(self._device)
         self.policy.eval()
+        if self._compute_dtype is not None:
+            # Only the backbone. The normalization buffers stay fp32: they are
+            # applied outside `policy.model` and mean/std in bf16 would quantize
+            # the joint statistics the action chunk is unnormalized with.
+            self.policy.model.to(dtype=self._compute_dtype)
         self._validate_normalization_statistics(self.policy)
+        if compile_model:
+            self._compile_denoise_step()
         self.chunk_size = int(config.chunk_size)
         logging.info(
-            "Loaded SmolVLA: device=%s chunk_size=%d action_dim=%d (checkpoint stores state=%d action=%d)",
+            "Loaded SmolVLA: device=%s dtype=%s attn=%s chunk_size=%d num_steps=%d action_dim=%d "
+            "(checkpoint stores state=%d action=%d)",
             self._device,
+            self._compute_dtype or torch.float32,
+            attn_implementation,
             self.chunk_size,
+            int(config.num_steps),
             ACTION_DIM,
             self._state_width,
             self._action_width,
         )
+
+    @staticmethod
+    def _resolve_precision(torch, precision: str | None, device) -> object | None:
+        """Return the dtype to hold the backbone in, or None to leave it as built.
+
+        The policy is built as a silent mix: everything transformers constructs
+        follows the base config's `torch_dtype` (bfloat16), while the cross-attn
+        k_proj/v_proj that `smolvlm_with_expert2` substitutes in and the
+        projections `VLAFlowMatching` adds are plain `nn.Linear`, so they land in
+        torch's fp32 default. Loading the checkpoint copies into those tensors and
+        keeps their dtypes. Naming a precision here is what makes the model
+        uniform; "fp32" leaves the hybrid in place, which is what HEAD ran.
+        """
+        choices = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}
+        if precision is None:
+            precision = "bf16" if device.type == "cuda" else "fp32"
+        if precision not in choices:
+            raise ValueError(f"precision must be one of {sorted(choices)}, got '{precision}'")
+        dtype = choices[precision]
+        if dtype is None:
+            return None
+        if device.type != "cuda":
+            logging.warning(
+                "precision=%s requested on %s; leaving weight dtypes as built", precision, device.type
+            )
+            return None
+        if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            logging.warning(
+                "This GPU has no bfloat16 support; leaving weight dtypes as built "
+                "(try --precision fp16)"
+            )
+            return None
+        return dtype
+
+    def _compile_denoise_step(self) -> None:
+        """Compile the per-step expert pass, which is what the loop repeats.
+
+        `sample_actions` is not `forward`, so wrapping the module would leave it
+        interpreted; the denoise step is where `num_steps` x `num_vlm_layers`
+        worth of small kernel launches actually accumulate. Dynamo errors are
+        suppressed so a compile failure degrades to eager instead of taking the
+        robot down mid-run, and the first chunk pays the compilation.
+        """
+        torch = self._torch
+        try:
+            import torch._dynamo as dynamo
+
+            dynamo.config.suppress_errors = True
+        except ImportError:  # pragma: no cover - torch always ships dynamo in 2.x
+            logging.warning("torch._dynamo unavailable; skipping compilation")
+            return
+        model = self.policy.model
+        model.denoise_step = torch.compile(model.denoise_step, dynamic=False)
+        logging.info("Compiled denoise_step; the first chunk will include compilation time")
+
+    def _synchronize_for_profile(self) -> None:
+        if self._profile_inference and self._device.type == "cuda":
+            self._torch.cuda.synchronize(self._device)
+
+    def _profile_mark(self, marks: list[tuple[str, float]], name: str) -> None:
+        if self._profile_inference:
+            self._synchronize_for_profile()
+            marks.append((name, time.monotonic()))
+
+    def _prepare_language_cached(self, batch: dict, task: str):
+        batch_size = int(batch[OBS_STATE].shape[0])
+        cache_key = (task, batch_size, str(self._device))
+        cached = self._language_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        language = self.policy.prepare_language(batch)
+        self._language_cache[cache_key] = language
+        return language
 
     @staticmethod
     def _validate_config(config) -> tuple[int, int]:
@@ -211,25 +323,38 @@ class SmolVLARuntime:
                     trained_hw[1],
                 )
             tensor = torch.from_numpy(np.ascontiguousarray(image))
-            tensor = tensor.permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
-            batch[key] = tensor.unsqueeze(0).to(self._device)
+            if tensor.dtype == torch.uint8:
+                # Send the 8-bit frame across PCIe and widen it on the GPU: a
+                # quarter of the bytes of an fp32 conversion done host-side, for
+                # three cameras on every control tick. Bit-identical result.
+                tensor = tensor.to(self._device, non_blocking=True)
+                tensor = tensor.permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
+            else:
+                tensor = tensor.permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
+                tensor = tensor.to(self._device)
+            batch[key] = tensor.unsqueeze(0)
         return batch
 
     def infer_action_chunk(self, observation: dict, task: str) -> tuple[np.ndarray, float]:
         """Return unnormalized direct-trigger actions with shape [T, 16]."""
         torch = self._torch
+        marks: list[tuple[str, float]] = [("start", time.monotonic())]
         batch = self._make_batch(observation, task)
+        self._profile_mark(marks, "make_batch")
         amp = (
             torch.autocast(device_type=self._device.type)
             if self._device.type == "cuda" and self._use_amp
             else nullcontext()
         )
-        start = time.monotonic()
         with torch.inference_mode(), amp:
             normalized = self.policy.normalize_inputs(batch)
+            self._profile_mark(marks, "normalize")
             images, image_masks = self.policy.prepare_images(normalized)
+            self._profile_mark(marks, "images")
             state = self.policy.prepare_state(normalized)
-            language_tokens, language_masks = self.policy.prepare_language(normalized)
+            self._profile_mark(marks, "state")
+            language_tokens, language_masks = self._prepare_language_cached(normalized, task)
+            self._profile_mark(marks, "language")
             actions = self.policy.model.sample_actions(
                 images,
                 image_masks,
@@ -237,14 +362,23 @@ class SmolVLARuntime:
                 language_masks,
                 state,
             )
+            self._profile_mark(marks, "sample")
             # `sample_actions` always emits `max_action_dim` columns, so narrow
             # to whatever width the unnormalize buffers were saved at before
             # applying them, and only then down to the real TeleAvatar action.
             actions = actions[:, :, : self._action_width]
             actions = self.policy.unnormalize_outputs({"action": actions})["action"]
             actions = actions[:, :, :ACTION_DIM]
-        elapsed_ms = (time.monotonic() - start) * 1000.0
         chunk = actions[0].detach().to(dtype=torch.float32, device="cpu").numpy()
+        self._profile_mark(marks, "cpu")
+        elapsed_ms = (time.monotonic() - marks[0][1]) * 1000.0
+        if self._profile_inference:
+            parts = []
+            for (prev_name, prev_time), (name, current_time) in zip(
+                marks[:-1], marks[1:], strict=True
+            ):
+                parts.append(f"{prev_name}->{name}={(current_time - prev_time) * 1000.0:.1f}ms")
+            logging.info("inference profile: %s total=%.1fms", " ".join(parts), elapsed_ms)
         if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM or not np.isfinite(chunk).all():
             raise RuntimeError(f"Policy returned an invalid action chunk: {chunk.shape}")
         return chunk, elapsed_ms

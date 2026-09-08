@@ -109,6 +109,13 @@ class SmolVLA2Config(PreTrainedConfig):
 
     attention_mode: str = "cross_attn"
 
+    # Kernel used inside the hand-rolled attention layers. "eager" keeps the
+    # original fp32-upcast implementation and is the training default so loss
+    # curves stay reproducible. "sdpa" routes the same maths through
+    # `F.scaled_dot_product_attention`, which avoids materializing the
+    # [B, H, Lq, Lk] score matrix and picks a fused kernel; deployment sets it.
+    attn_implementation: str = "eager"
+
     prefix_length: int = -1
 
     pad_language_to: str = "longest"  # "max_length"

@@ -7,6 +7,7 @@
 #
 # Run it on the ROBOT host, not the training server. Stages:
 #   ./scripts/deploy_small_ta2_robot.sh check     # env + checkpoint, no ROS
+#   ./scripts/deploy_small_ta2_robot.sh bench     # time inference on random data, no ROS
 #   ./scripts/deploy_small_ta2_robot.sh cameras   # decode RTP, save six crops
 #   ./scripts/deploy_small_ta2_robot.sh observe   # print the exact observation
 #   ./scripts/deploy_small_ta2_robot.sh zero      # move both arms to zero
@@ -30,7 +31,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/${EXP_NAME}}"
 # ... 010000 plus "last". Training loss flattened by ~2000 steps and the run
 # went to 10000 with no validation set, so the late checkpoints are the ones
 # most likely to have overfit 4695 frames. Start at 002000 and walk forward.
-CKPT_STEP="${CKPT_STEP:-last}"
+CKPT_STEP="${CKPT_STEP:-016000}"
 CHECKPOINT="${CHECKPOINT:-${OUTPUT_DIR}/checkpoints/${CKPT_STEP}/pretrained_model}"
 
 # The VLM config/processor must already be on this host: deployment loads the
@@ -43,6 +44,23 @@ VLM_LOCAL_DIR="${VLM_LOCAL_DIR:-${PROJECT_ROOT}/weights/${VLM_REPO_ID}}"
 # episodes: the policy conditions on it and an unseen phrasing degrades it.
 TASK="${TASK:-a base layer is already in place, pick left-side block with the left arm and right-side block with the right arm, place block on the base layer.}"
 DEVICE="${DEVICE:-cuda}"
+# SmolVLA flow denoising steps. The checkpoint default is normally 10. Lower
+# values cut inference time nearly linearly; validate quality on hardware.
+NUM_STEPS="${NUM_STEPS:-}"
+PROFILE_INFERENCE="${PROFILE_INFERENCE:-0}"
+# Backbone dtype. The checkpoint is stored in fp32, so fp32 runs the vision
+# tower and both transformer stacks without tensor cores. Empty = bf16 on CUDA.
+# Set to fp32 to reproduce the pre-optimization numerics exactly.
+PRECISION="${PRECISION:-fp32}"
+# Attention kernel: sdpa (fused, deployment default) or eager (matches training).
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+# torch.compile the denoise step. Fuses the per-step expert pass, which cuts the
+# Python-side kernel launches the control loop is otherwise starved on: measured
+# 274ms -> 160ms median per chunk with the cameras and arms streaming. The
+# runner absorbs the one-off compilation in its warmup, before the control loop.
+COMPILE_MODEL="${COMPILE_MODEL:-1}"
+# Timed iterations for the 'bench' stage.
+BENCH_ITERS="${BENCH_ITERS:-20}"
 
 # Actions are executed open-loop at this rate. The dataset is 30fps; 20Hz
 # leaves headroom for inference between chunks.
@@ -73,11 +91,17 @@ fi
 
 # --- Environment ----------------------------------------------------------
 if [[ -n "${CONDA_ENV}" && "${CONDA_DEFAULT_ENV:-}" != "${CONDA_ENV}" ]]; then
-    for base in "${CONDA_PREFIX_1:-}" "${HOME}/miniconda3" "${HOME}/anaconda3" /opt/conda; do
+    for base in "${CONDA_PREFIX_1:-}" "${HOME}/miniforge3" "${HOME}/mambaforge" \
+                "${HOME}/miniconda3" "${HOME}/anaconda3" /opt/conda; do
         if [[ -n "${base}" && -f "${base}/etc/profile.d/conda.sh" ]]; then
+            # conda's own activation scripts, and the ROS hooks an env may drop
+            # into activate.d, read unset variables freely. They are not written
+            # against `set -u`, so relax it for the activation only.
+            set +u
             # shellcheck disable=SC1091
             source "${base}/etc/profile.d/conda.sh"
             conda activate "${CONDA_ENV}"
+            set -u
             break
         fi
     done
@@ -236,6 +260,34 @@ PY
     echo "[info] check passed. Next: '${0##*/} cameras' with the RTP stream running."
     ;;
 
+bench)
+    # Offline latency check: no ROS, no cameras, no arms. Feeds the policy random
+    # frames shaped like the real ones, so it measures the policy and nothing
+    # else. Takes the same precision/attention switches as 'run', so a number
+    # here transfers to the control loop; it also reports the result against the
+    # chunk budget CONTROL_FREQUENCY and EXECUTION_HORIZON imply.
+    check_checkpoint
+    resolve_vlm_flag
+
+    bench_args=(
+        --checkpoint "${CHECKPOINT}"
+        --smolvla-repo "${PROJECT_ROOT}"
+        "${VLM_FLAG[@]}"
+        --device "${DEVICE}"
+        --task "${TASK}"
+        --iters "${BENCH_ITERS}"
+        --control-frequency "${CONTROL_FREQUENCY}"
+        --execution-horizon "${EXECUTION_HORIZON}"
+    )
+    [[ -n "${NUM_STEPS}" ]] && bench_args+=(--num-steps "${NUM_STEPS}")
+    [[ -n "${PRECISION}" ]] && bench_args+=(--precision "${PRECISION}")
+    bench_args+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
+    [[ "${COMPILE_MODEL}" == "1" ]] && bench_args+=(--compile)
+    [[ "${PROFILE_INFERENCE}" == "1" ]] && bench_args+=(--profile-inference)
+
+    exec python scripts/bench_inference.py "${bench_args[@]}"
+    ;;
+
 cameras)
     # Saves all six crops. Open them and confirm the three left-eye views match
     # what training saw: same mounting, similar lighting, nothing occluded.
@@ -279,6 +331,11 @@ dry|run)
         --rtp-port "${RTP_PORT}"
         --arm-config "${DEPLOY_ROOT}/arm_config.yml"
     )
+    [[ -n "${NUM_STEPS}" ]] && run_args+=(--num-steps "${NUM_STEPS}")
+    [[ -n "${PRECISION}" ]] && run_args+=(--precision "${PRECISION}")
+    run_args+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
+    [[ "${COMPILE_MODEL}" == "1" ]] && run_args+=(--compile)
+    [[ "${PROFILE_INFERENCE}" == "1" ]] && run_args+=(--profile-inference)
     [[ "${MAX_CHUNKS}" != "0" ]] && run_args+=(--max-chunks "${MAX_CHUNKS}")
 
     echo "[info] task: ${TASK}"
@@ -305,7 +362,7 @@ dry|run)
 
 *)
     echo "[error] unknown stage '${STAGE}'" >&2
-    echo "[info] stages: check | cameras | observe | zero | dry | run" >&2
+    echo "[info] stages: check | bench | cameras | observe | zero | dry | run" >&2
     exit 1
     ;;
 esac

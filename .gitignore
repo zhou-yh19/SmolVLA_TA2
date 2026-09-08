@@ -4,11 +4,14 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.claude/
 build/
 weights/
 datasets/
+outputs/
 weights
 datasets
+outputs
 develop-eggs/
 dist/
 downloads/

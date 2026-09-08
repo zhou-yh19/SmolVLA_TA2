@@ -5,6 +5,7 @@ rsync -avz --progress \
 	--exclude='datasets' \
 	--exclude='datasets/' \
 	--exclude='outputs/' \
+	--exclude='outputs' \
     --exclude='__pycache__/' \
     --exclude='*.pyc' \
     	./ \

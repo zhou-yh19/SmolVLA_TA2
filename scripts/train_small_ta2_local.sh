@@ -46,7 +46,7 @@ DATASET_REPO_IDS="${DATASET_REPO_IDS:-small_lerobot_30fps,middle_lerobot_30fps,l
 # so the largest dataset dominates in proportion to its length.
 DATASET_SAMPLING_WEIGHTS="${DATASET_SAMPLING_WEIGHTS:-}"
 
-EXP_NAME="${EXP_NAME:-smolvla_ta2_multi_run06}"
+EXP_NAME="${EXP_NAME:-smolvla_ta2_multi_run07}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/${EXP_NAME}}"
 
 # RESUME=1 continues an existing run instead of starting a new fine-tune from
@@ -60,7 +60,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/${EXP_NAME}}"
 # maintains (train.py:549). Override it to rewind to an earlier step:
 #   RESUME=1 RESUME_CHECKPOINT=outputs/<exp>/checkpoints/004000 \
 #       ./scripts/train_small_ta2_local.sh
-RESUME="${RESUME:-1}"
+RESUME="${RESUME:-0}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-${OUTPUT_DIR}/checkpoints/last}"
 
 # The complete pretrained SmolVLA checkpoint to fine-tune from: backbone AND
@@ -629,9 +629,3 @@ accelerate launch \
     "${train_args[@]}" 2>&1 | tee "${log_file}"
 
 echo "[info] Training completed: ${OUTPUT_DIR}"
-
-
-for d in small_lerobot_30fps middle_lerobot_30fps large_lerobot_30fps; do
-    python scripts/compute_teleavatar_v2_stats.py \
-        --dataset /home/arapat/disk0/small_lerobot_30fps
-done

@@ -29,7 +29,8 @@ teleavatar_v2/
 
 ## Runtime contract
 
-- State: 14 absolute arm positions, left 7 followed by right 7.
+- State: 16 values: left arm 7, right arm 7, then measured left/right gripper
+  positions.
 - Cameras: head left eye, left-wrist left eye, right-wrist left eye, as cropped
   from the 1280x2720 RTP composite (head 960x960, wrists 400x640). Training
   frames are downscaled to these same sizes, and the runtime warns once per
@@ -124,6 +125,26 @@ for example `conda env export > environment.lock.local.yml`.
 
 ## Bring-up order
 
+Measure inference latency before touching the robot. This needs no ROS, no
+cameras and no arms: it loads the real checkpoint and feeds it random frames of
+the shapes the RTP splitter would deliver, so only the timings mean anything —
+the actions come from noise.
+
+```bash
+python scripts/bench_inference.py \
+  --checkpoint /path/to/checkpoint/pretrained_model \
+  --smolvla-repo /path/to/SmolVLA_TA2 \
+  --vlm-model-path /path/to/SmolVLM2-500M-Video-Instruct \
+  --device cuda \
+  --iters 20
+```
+
+It reports the latency distribution and how much of the chunk budget
+(`execution_horizon / control_frequency`) the p90 consumes. Add
+`--profile-inference` to see where the time goes; on this policy essentially
+all of it is `sample_actions`, which costs a fixed prefix pass plus
+`--num-steps` denoising steps.
+
 Check ROS topics:
 
 ```bash
@@ -159,6 +180,41 @@ python scripts/run_smolvla.py \
   --device cuda \
   --task "stack the three blocks"
 ```
+
+To diagnose latency, run a dry pass with per-stage timing:
+
+```bash
+python scripts/run_smolvla.py \
+  --checkpoint /path/to/checkpoint/pretrained_model \
+  --smolvla-repo /path/to/SmolVLA_TA2 \
+  --device cuda \
+  --task "stack the three blocks" \
+  --profile-inference
+```
+
+For speed/quality A/B tests, reduce the flow denoising steps from the
+checkpoint default, usually 10:
+
+```bash
+python scripts/run_smolvla.py \
+  --checkpoint /path/to/checkpoint/pretrained_model \
+  --smolvla-repo /path/to/SmolVLA_TA2 \
+  --device cuda \
+  --task "stack the three blocks" \
+  --num-steps 6
+```
+
+`bench_inference.py`, `run_smolvla.py` and every stage of
+`scripts/deploy_small_ta2_robot.sh` share the same speed switches:
+
+| flag | env var in the deploy script | default | effect |
+| --- | --- | --- | --- |
+| `--precision {fp32,bf16,fp16}` | `PRECISION` | `bf16` on CUDA | dtype the backbone is held in. The checkpoint is a silent fp32/bf16 mix; `fp32` leaves that mix in place, anything else makes it uniform. Largest single win. |
+| `--attn-implementation {sdpa,eager}` | `ATTN_IMPLEMENTATION` | `sdpa` | `sdpa` uses the fused kernel; `eager` materializes the full score matrix and matches training exactly. |
+| `--num-steps N` | `NUM_STEPS` | checkpoint value (10) | flow denoising steps. Time is roughly linear in this; quality is not — validate on hardware. |
+| `--compile` | `COMPILE_MODEL=1` | off | `torch.compile` the denoise step. The first chunk pays compilation. |
+| `--profile-inference` | `PROFILE_INFERENCE=1` | off | per-stage timing on every chunk. |
+| `--iters N` | `BENCH_ITERS` | 20 | timed iterations, `bench` only. |
 
 Only after validating the logged state, cameras, action shape, and trigger
 range, enable execution explicitly:
