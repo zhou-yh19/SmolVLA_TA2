@@ -79,6 +79,13 @@ class SmolVLA2Config(PreTrainedConfig):
     # Decoding
     num_steps: int = 10
 
+    # Dtype for all model weights at construction time.  "fp32" is the
+    # historical default (torch's nn.Linear default) and what existing
+    # checkpoints were built with.  Set to "bf16" for new training runs to
+    # produce a uniform-dtype checkpoint that can be deployed without
+    # precision conversion.
+    model_dtype: str = "fp32"
+
     # Attention utils
     use_cache: bool = True
 

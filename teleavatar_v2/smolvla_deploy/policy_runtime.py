@@ -149,11 +149,12 @@ class SmolVLARuntime:
         if compile_model:
             self._compile_denoise_step()
         self.chunk_size = int(config.chunk_size)
+        _ckpt_dtype = getattr(config, "model_dtype", "fp32(mixed-legacy)")
         logging.info(
             "Loaded SmolVLA: device=%s dtype=%s attn=%s chunk_size=%d num_steps=%d action_dim=%d "
             "(checkpoint stores state=%d action=%d)",
             self._device,
-            self._compute_dtype or torch.float32,
+            self._compute_dtype or _ckpt_dtype,
             attn_implementation,
             self.chunk_size,
             int(config.num_steps),
@@ -164,19 +165,23 @@ class SmolVLARuntime:
 
     @staticmethod
     def _resolve_precision(torch, precision: str | None, device) -> object | None:
-        """Return the dtype to hold the backbone in, or None to leave it as built.
+        """Return the dtype to cast the model to after loading, or None to leave it as built.
 
-        The policy is built as a silent mix: everything transformers constructs
-        follows the base config's `torch_dtype` (bfloat16), while the cross-attn
-        k_proj/v_proj that `smolvlm_with_expert2` substitutes in and the
-        projections `VLAFlowMatching` adds are plain `nn.Linear`, so they land in
-        torch's fp32 default. Loading the checkpoint copies into those tensors and
-        keeps their dtypes. Naming a precision here is what makes the model
-        uniform; "fp32" leaves the hybrid in place, which is what HEAD ran.
+        None (the default) means no conversion: the checkpoint is loaded exactly as
+        stored, preserving the dtype layout it was trained with.  New checkpoints
+        built with model_dtype="bf16" will be uniformly bfloat16; old mixed-dtype
+        checkpoints will stay mixed.  Either way the inference numerics match
+        training without any explicit flag.
+
+        Pass an explicit precision only to override that layout intentionally, e.g.
+        to test numerics or squeeze out latency.  "fp32" forces everything to fp32;
+        "bf16" and "fp16" unify to those dtypes — useful only if the checkpoint was
+        saved uniformly (model_dtype="bf16") and you want to confirm you are not
+        accidentally hitting fp32 paths.
         """
-        choices = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}
         if precision is None:
-            precision = "bf16" if device.type == "cuda" else "fp32"
+            return None
+        choices = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}
         if precision not in choices:
             raise ValueError(f"precision must be one of {sorted(choices)}, got '{precision}'")
         dtype = choices[precision]

@@ -48,10 +48,11 @@ DEVICE="${DEVICE:-cuda}"
 # values cut inference time nearly linearly; validate quality on hardware.
 NUM_STEPS="${NUM_STEPS:-}"
 PROFILE_INFERENCE="${PROFILE_INFERENCE:-0}"
-# Backbone dtype. The checkpoint is stored in fp32, so fp32 runs the vision
-# tower and both transformer stacks without tensor cores. Empty = bf16 on CUDA.
-# Set to fp32 to reproduce the pre-optimization numerics exactly.
-PRECISION="${PRECISION:-fp32}"
+# Backbone dtype. Empty (default) = load the checkpoint as-is, preserving the
+# dtype layout it was trained with (matches training exactly). Explicit fp32/bf16/fp16
+# forces all backbone weights to that dtype after loading; only use this to
+# override the checkpoint intentionally or to test numerics.
+PRECISION="${PRECISION:-}"
 # Attention kernel: sdpa (fused, deployment default) or eager (matches training).
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 # torch.compile the denoise step. Fuses the per-step expert pass, which cuts the
@@ -204,6 +205,8 @@ for key, want in (
 chunk = config.get("chunk_size")
 if chunk:
     print(f"[info] chunk_size={chunk}")
+model_dtype = config.get("model_dtype", "fp32(mixed-legacy)")
+print(f"[info] model_dtype={model_dtype}")
 
 if problems:
     raise SystemExit("[error] checkpoint/runtime contract mismatch:\n  - " + "\n  - ".join(problems))

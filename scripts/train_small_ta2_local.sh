@@ -112,7 +112,7 @@ EVAL_FREQ="${EVAL_FREQ:--1}"
 # train on everything. With 135 episodes across the TA2 datasets, 3 per dataset
 # is a few percent of the data -- enough to see a train/val gap open up,
 # cheap enough not to matter for fitting.
-VAL_EPISODES_PER_DATASET="${VAL_EPISODES_PER_DATASET:-3}"
+VAL_EPISODES_PER_DATASET="${VAL_EPISODES_PER_DATASET:-0}"
 # The split is a deterministic function of this seed and each dataset's
 # repo_id. Keep it fixed across a comparison; changing it reshuffles the
 # holdout and invalidates every earlier val number.
@@ -122,6 +122,11 @@ VAL_SPLIT_SEED="${VAL_SPLIT_SEED:-1000}"
 # full 10-step open-loop rollout for the per-joint error in radians.
 VAL_MAX_BATCHES="${VAL_MAX_BATCHES:-50}"
 VAL_ACTION_BATCHES="${VAL_ACTION_BATCHES:-10}"
+
+# Photometric augmentation is applied after camera adaptation, on training
+# images only. Keep geometry and color identity intact for block placement.
+# These CLI settings also override a resumed run's saved augmentation config.
+IMAGE_TRANSFORMS_ENABLE="${IMAGE_TRANSFORMS_ENABLE:-true}"
 
 # The VLM backbone. Prefer the copy under weights/ so the run needs no network:
 # transformers' from_pretrained accepts a local directory, and every call site
@@ -142,6 +147,11 @@ OPTIMIZER_LR="${OPTIMIZER_LR:-1e-4}"
 TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}"
 FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-true}"
 USE_AMP="${USE_AMP:-true}"
+# Dtype for all model weights at construction time. "fp32" is the historical
+# default (what existing checkpoints were built with). "bf16" builds a fully
+# uniform checkpoint that can be deployed without any precision conversion and
+# saves ~30% checkpoint size. Requires a fresh training run to take effect.
+MODEL_DTYPE="${MODEL_DTYPE:-fp32}"
 
 # On by default: offline mode needs no network and writes structured metrics
 # under wandb/, which is the only record that survives. The plain log stream
@@ -498,6 +508,13 @@ print("[info] GPU kernel probe: OK")
 PY
 
 # --- Training arguments ---------------------------------------------------
+image_transform_tfs='{
+    "brightness": {"weight": 1.0, "type": "ColorJitter", "kwargs": {"brightness": [0.9, 1.1]}},
+    "contrast": {"weight": 1.0, "type": "ColorJitter", "kwargs": {"contrast": [0.9, 1.1]}},
+    "saturation": {"weight": 0.0, "type": "ColorJitter", "kwargs": {"saturation": [1.0, 1.0]}},
+    "hue": {"weight": 0.0, "type": "ColorJitter", "kwargs": {"hue": [0.0, 0.0]}},
+    "sharpness": {"weight": 1.0, "type": "SharpnessJitter", "kwargs": {"sharpness": [0.9, 1.1]}}
+}'
 train_args=(
     --policy.vlm_model_name="${VLM_MODEL_NAME}"
     --policy.push_to_hub=false
@@ -507,6 +524,10 @@ train_args=(
     --dataset.repo_id="${DATASET_REPO_IDS}"
     --dataset.root="${DATASET_ROOT}"
     --dataset.video_backend=pyav
+    --dataset.image_transforms.enable="${IMAGE_TRANSFORMS_ENABLE}"
+    --dataset.image_transforms.max_num_transforms=2
+    --dataset.image_transforms.random_order=false
+    --dataset.image_transforms.tfs="${image_transform_tfs}"
     --output_dir="${OUTPUT_DIR}"
     --job_name="${EXP_NAME}"
     --batch_size="${BATCH_SIZE}"
@@ -522,6 +543,7 @@ train_args=(
     --val_max_batches="${VAL_MAX_BATCHES}"
     --val_action_batches="${VAL_ACTION_BATCHES}"
     --policy.use_amp="${USE_AMP}"
+    --policy.model_dtype="${MODEL_DTYPE}"
     --wandb.project="${WANDB_PROJECT}"
     --wandb.mode="${WANDB_MODE}"
     --trackio.enable=false
@@ -600,7 +622,8 @@ if (( total_frames > 0 )); then
          "${NUM_TRAIN_STEPS} steps = $(( NUM_TRAIN_STEPS * global_batch / total_frames )) epochs"
 fi
 echo "[info] adapter: 72-dim -> state 16 (arms14 + measured gripper positions2) / action 16; 3 cameras cropped to left eye and downscaled to the deploy feed (head 960x960, wrists 400x640)"
-echo "[info] policy_init=${policy_init} optimizer_lr=${OPTIMIZER_LR} train_expert_only=${TRAIN_EXPERT_ONLY} freeze_vision_encoder=${FREEZE_VISION_ENCODER}"
+echo "[info] image augmentation: enabled=${IMAGE_TRANSFORMS_ENABLE}; train only; 2 of brightness/contrast/sharpness in [0.9, 1.1]; no hue, saturation, or geometry changes"
+echo "[info] policy_init=${policy_init} optimizer_lr=${OPTIMIZER_LR} train_expert_only=${TRAIN_EXPERT_ONLY} freeze_vision_encoder=${FREEZE_VISION_ENCODER} model_dtype=${MODEL_DTYPE}"
 echo "[info] GPUs=${NUM_PROCESSES} batch_per_gpu=${BATCH_SIZE} global_batch=${global_batch}"
 echo "[info] workers_per_process=${NUM_WORKERS} steps=${NUM_TRAIN_STEPS} output=${OUTPUT_DIR}"
 echo "[info] scheduler_warmup_steps=${SCHEDULER_WARMUP_STEPS} scheduler_decay_steps=${SCHEDULER_DECAY_STEPS} scheduler_decay_lr=${SCHEDULER_DECAY_LR}"

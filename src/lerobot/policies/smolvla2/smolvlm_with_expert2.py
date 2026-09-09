@@ -73,6 +73,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         attn_implementation: str = "eager",
+        model_dtype: str = "fp32",
     ):
         super().__init__()
         if load_vlm_weights:
@@ -118,6 +119,14 @@ class SmolVLMWithExpertModel(nn.Module):
                 f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
+        _dtype_map = {"fp32": None, "bf16": "bfloat16", "fp16": "float16"}
+        if model_dtype not in _dtype_map:
+            raise ValueError(f"model_dtype must be fp32/bf16/fp16, got {model_dtype!r}")
+        if model_dtype != "fp32":
+            # Uniform-dtype training: bring lm_expert into the same dtype as
+            # the projection layers we are about to create.
+            lm_expert_config.torch_dtype = _dtype_map[model_dtype]
+        self._model_dtype = model_dtype
         self.lm_expert = AutoModel.from_config(lm_expert_config)
 
         self.num_expert_layers = len(self.lm_expert.layers)
@@ -127,15 +136,20 @@ class SmolVLMWithExpertModel(nn.Module):
             for layer_idx in range(len(self.lm_expert.layers)):
                 if self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0:
                     continue
+                _kv_dtype = None if model_dtype == "fp32" else getattr(
+                    __import__("torch"), _dtype_map[model_dtype]
+                )
                 self.lm_expert.layers[layer_idx].self_attn.k_proj = nn.Linear(
                     config.text_config.num_key_value_heads * config.text_config.head_dim,
                     lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
                     bias=lm_expert_config.attention_bias,
+                    dtype=_kv_dtype,
                 )
                 self.lm_expert.layers[layer_idx].self_attn.v_proj = nn.Linear(
                     config.text_config.num_key_value_heads * config.text_config.head_dim,
                     lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
                     bias=lm_expert_config.attention_bias,
+                    dtype=_kv_dtype,
                 )
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None

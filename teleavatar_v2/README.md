@@ -209,7 +209,7 @@ python scripts/run_smolvla.py \
 
 | flag | env var in the deploy script | default | effect |
 | --- | --- | --- | --- |
-| `--precision {fp32,bf16,fp16}` | `PRECISION` | `bf16` on CUDA | dtype the backbone is held in. The checkpoint is a silent fp32/bf16 mix; `fp32` leaves that mix in place, anything else makes it uniform. Largest single win. |
+| `--precision {fp32,bf16,fp16}` | `PRECISION` | empty (no conversion) | post-load dtype override. Empty (the default) loads the checkpoint as stored, which is correct for both old mixed-dtype checkpoints and new uniform ones trained with `MODEL_DTYPE=bf16`. Set explicitly only to test numerics or force a specific dtype. |
 | `--attn-implementation {sdpa,eager}` | `ATTN_IMPLEMENTATION` | `sdpa` | `sdpa` uses the fused kernel; `eager` materializes the full score matrix and matches training exactly. |
 | `--num-steps N` | `NUM_STEPS` | checkpoint value (10) | flow denoising steps. Time is roughly linear in this; quality is not — validate on hardware. |
 | `--compile` | `COMPILE_MODEL=1` | off | `torch.compile` the denoise step. The first chunk pays compilation. |

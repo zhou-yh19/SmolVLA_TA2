@@ -870,6 +870,13 @@ class VLAFlowMatching(nn.Module):
         super().__init__()
         self.config = config
 
+        _model_dtype_str = getattr(self.config, "model_dtype", "fp32")
+        _dtype_map = {"fp32": None, "bf16": "bfloat16", "fp16": "float16"}
+        if _model_dtype_str not in _dtype_map:
+            raise ValueError(f"model_dtype must be fp32/bf16/fp16, got {_model_dtype_str!r}")
+        _proj_dtype = None if _model_dtype_str == "fp32" else getattr(
+            __import__("torch"), _dtype_map[_model_dtype_str]
+        )
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
@@ -881,24 +888,35 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             attn_implementation=getattr(self.config, "attn_implementation", "eager"),
+            model_dtype=_model_dtype_str,
         )
         self.vlm_with_expert.configure_peft(config=self.config)
-        # Projections are float32
+        # Projection dtype follows model_dtype so the whole model is uniform.
         self.state_to_prefix = self.config.state_to_prefix
         if self.state_to_prefix:
             self.state_proj = nn.Linear(
-                self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
+                self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size,
+                dtype=_proj_dtype,
             )
         else:
-            self.state_proj = nn.Linear(self.config.max_state_dim, self.vlm_with_expert.expert_hidden_size)
-        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
-        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+            self.state_proj = nn.Linear(
+                self.config.max_state_dim, self.vlm_with_expert.expert_hidden_size,
+                dtype=_proj_dtype,
+            )
+        self.action_in_proj = nn.Linear(
+            self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size, dtype=_proj_dtype
+        )
+        self.action_out_proj = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim, dtype=_proj_dtype
+        )
 
         self.action_time_mlp_in = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
+            self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size,
+            dtype=_proj_dtype,
         )
         self.action_time_mlp_out = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
+            self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size,
+            dtype=_proj_dtype,
         )
 
         self.set_requires_grad()

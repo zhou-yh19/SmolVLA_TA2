@@ -183,6 +183,29 @@ shape `[B, horizon, 16]`, and the three canonical image keys
 `observation.images.image`, `image2`, and `image3`. Deployment must use the same
 all-left-eye camera convention.
 
+### Light visual augmentation for local TA2 training
+
+`scripts/train_small_ta2_local.sh` enables light photometric augmentation by
+default. Each camera image independently receives two randomly selected
+transforms: brightness, contrast, or sharpness, each with a factor in
+`[0.9, 1.1]`. Hue and saturation transforms are disabled; there is no crop,
+flip, or rotation augmentation.
+
+Augmentation runs after the existing left-eye crop and deployment-resolution
+resize, on training images only. Camera keys/order, image shapes and value
+range, state/action layouts, and normalization statistics are unchanged.
+Validation and deployment do not apply these random transforms.
+
+For an unaugmented comparison run:
+
+```bash
+IMAGE_TRANSFORMS_ENABLE=false bash scripts/train_small_ta2_local.sh
+```
+
+The settings are saved in `train_config.json`. The local launcher also applies
+them with `RESUME=1`, overriding the saved augmentation settings; use the same
+switch value as the original run to preserve its augmentation behavior.
+
 ### Fine-tuning from a pretrained SmolVLA checkpoint
 
 Use `--policy.type=smolvla2` to initialize a new policy from the SmolVLM
