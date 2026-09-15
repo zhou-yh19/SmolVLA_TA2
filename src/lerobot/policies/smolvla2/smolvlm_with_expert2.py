@@ -259,19 +259,47 @@ class SmolVLMWithExpertModel(nn.Module):
             self.vlm.eval()
 
     def embed_image(self, image: torch.Tensor):
-        patch_attention_mask = None
-        # Get sequence from the vision encoder
-        image_hidden_states = (
-            self.get_vlm_model()
-            .vision_model(
-                pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
-                patch_attention_mask=patch_attention_mask,
-            )
-            .last_hidden_state
+        # Equivalent to `vision_model(pixel_values=image, patch_attention_mask=None)`,
+        # which builds an all-ones patch mask and then derives the position ids
+        # from it on the host, one `.item()`/`.cpu()` at a time. Those syncs
+        # drain the launch queue three times per chunk at deployment and make
+        # the forward impossible to capture in a CUDA graph. An all-ones mask
+        # means "attend everywhere" and a full-grid position layout, so both
+        # are computed once per grid shape here and the encoder runs unmasked.
+        vision_model = self.get_vlm_model().vision_model
+        embeddings = vision_model.embeddings
+        pixel_values = image.to(dtype=vision_model.dtype)
+        patch_embeds = embeddings.patch_embedding(pixel_values).flatten(2).transpose(1, 2)
+        position_ids = self._full_grid_position_ids(
+            pixel_values.shape[2] // embeddings.patch_size,
+            pixel_values.shape[3] // embeddings.patch_size,
+            embeddings.num_patches_per_side,
+            embeddings.position_embedding.weight.device,
         )
+        hidden_states = patch_embeds + embeddings.position_embedding(position_ids)
+        encoder_outputs = vision_model.encoder(inputs_embeds=hidden_states, attention_mask=None)
+        image_hidden_states = vision_model.post_layernorm(encoder_outputs[0])
         # Modality projection & resampling
         image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
         return image_hidden_states
+
+    def _full_grid_position_ids(self, nb_patches_h: int, nb_patches_w: int, side: int, device):
+        """Position ids `SmolVLMVisionEmbeddings` assigns to a fully valid patch grid, shape [1, H*W]."""
+        cache = self.__dict__.setdefault("_grid_position_ids", {})
+        key = (nb_patches_h, nb_patches_w, side, str(device))
+        position_ids = cache.get(key)
+        if position_ids is None:
+            # Same arithmetic as the upstream loop body, dtype quirks included:
+            # the step is an fp32 tensor division, and the buckets are right-closed.
+            boundaries = torch.arange(1 / side, 1.0, 1 / side)
+            fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / torch.tensor(nb_patches_h))
+            fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / torch.tensor(nb_patches_w))
+            bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
+            bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+            position_ids = (bucket_coords_h[:, None] * side + bucket_coords_w).flatten()[None, :]
+            position_ids = position_ids.to(device)
+            cache[key] = position_ids
+        return position_ids
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)

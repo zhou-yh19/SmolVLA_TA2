@@ -2,10 +2,16 @@
 """
 Receive a Teleavatar H265 RTP video stream as RGB images.
 
-This mirrors the image-facing part of TeleavatarROS2Interface: decoded frames
-are stored in latest_images under a lock, and get_observation() returns image
-copies. The interface keeps both the composite frame and six split camera views.
-Test-only file writing lives in test.py.
+This mirrors the image-facing part of TeleavatarROS2Interface: the latest
+decoded frame is kept under a lock, and get_observation() returns image copies.
+The interface exposes both the composite frame and six split camera views.
+Test-only file writing lives in test_video.py.
+
+The GStreamer streaming thread hands over only a reference to the decoded
+sample; the RGB conversion and the crops are computed by whichever thread asks
+for them. The policy consumes about one frame per chunk while the stream runs
+at ~45fps, and converting every frame in the callback cost ~20MB of copies per
+frame on a thread that then competed with inference for the GIL.
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ from collections import deque
 import logging
 import threading
 import time
-from typing import Dict
+from typing import Dict, Iterable
 from typing import Optional
 
 import numpy as np
@@ -69,12 +75,16 @@ class RTPH265VideoInterface:
 
         self.logger = logging.getLogger(self.__class__.__name__)
         self.lock = threading.Lock()
-        self.latest_images: Dict[str, np.ndarray] = {}
-        self.image_timestamps: Dict[str, float] = {}
+        # The newest decoded sample and when it arrived. Views are cut from it
+        # on demand; `_converted` memoizes them for the sample they came from.
+        self._latest_sample: Optional[Gst.Sample] = None
+        self._latest_timestamp: Optional[float] = None
+        self._converted: tuple[Optional[Gst.Sample], Dict[str, np.ndarray]] = (None, {})
 
         self._pipeline: Optional[Gst.Pipeline] = None
         self._loop: Optional[GLib.MainLoop] = None
         self._thread: Optional[threading.Thread] = None
+        self._rtp_probe: Optional[Gst.Element] = None
         self._first_frame = threading.Event()
         self._eos_or_error = threading.Event()
         self._stop_requested = False
@@ -109,6 +119,7 @@ class RTPH265VideoInterface:
         rtp_probe = pipeline.get_by_name("rtp_probe")
         if rtp_probe is not None:
             rtp_probe.connect("handoff", self._on_rtp_packet)
+        self._rtp_probe = rtp_probe
 
         h265_probe = pipeline.get_by_name("h265_probe")
         if h265_probe is not None:
@@ -166,32 +177,64 @@ class RTPH265VideoInterface:
 
     def get_observation(self) -> Optional[dict]:
         """Return current image observation, or None before the first frame."""
-        with self.lock:
-            if self.camera_name not in self.latest_images:
-                return None
-            return {"images": {name: image.copy() for name, image in self.latest_images.items()}}
+        images = self.get_latest_images()
+        if not images:
+            return None
+        return {"images": images}
 
     def get_latest_image(self) -> Optional[np.ndarray]:
         """Return the latest composite RGB image."""
-        with self.lock:
-            image = self.latest_images.get(self.camera_name)
-            return None if image is None else image.copy()
+        return self.get_views((self.camera_name,)).get(self.camera_name)
 
     def get_latest_images(self) -> Dict[str, np.ndarray]:
         """Return all latest images, including the composite and split crops."""
-        with self.lock:
-            return {name: image.copy() for name, image in self.latest_images.items()}
+        return self.get_views((self.camera_name, *self.split_image_names))
 
     def get_latest_images_with_timestamps(self) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
         """Return latest image copies and their receive timestamps."""
+        images = self.get_latest_images()
+        timestamps = self.get_image_timestamps()
+        return images, {name: timestamps[name] for name in images}
+
+    def get_views(self, names: Iterable[str]) -> Dict[str, np.ndarray]:
+        """Return copies of the requested views cut from the newest decoded frame.
+
+        Only the views asked for are converted, so a caller that needs three
+        crops does not pay for the composite and the other three. Empty before
+        the first frame.
+        """
+        names = tuple(names)
         with self.lock:
-            images = {name: image.copy() for name, image in self.latest_images.items()}
-            return images, dict(self.image_timestamps)
+            sample = self._latest_sample
+            cached_sample, cached = self._converted
+        if sample is None:
+            return {}
+        if cached_sample is not sample:
+            cached = {}
+        missing = [name for name in names if name not in cached]
+        if missing:
+            fresh = dict(cached)
+
+            def cut(frame: np.ndarray) -> None:
+                # `frame` only lives while the buffer is mapped, so every view
+                # handed out is a copy made in here.
+                for name in missing:
+                    fresh[name] = frame.copy() if name == self.camera_name else self._crop(frame, name)
+
+            _with_mapped_rgb(sample, cut)
+            with self.lock:
+                if self._latest_sample is sample:
+                    self._converted = (sample, fresh)
+            cached = fresh
+        return {name: cached[name].copy() for name in names if name in cached}
 
     def get_image_timestamps(self) -> Dict[str, float]:
-        """Return timestamps without copying the multi-megabyte RGB frames."""
+        """Return timestamps without touching the multi-megabyte RGB frames."""
         with self.lock:
-            return dict(self.image_timestamps)
+            timestamp = self._latest_timestamp
+        if timestamp is None:
+            return {}
+        return {name: timestamp for name in (self.camera_name, *self.split_image_names)}
 
     def has_initial_frame(self) -> bool:
         return self._first_frame.is_set()
@@ -213,6 +256,10 @@ class RTPH265VideoInterface:
         self._last_log_frame_count = 0
         self._decode_start_times.clear()
         self._latest_decode_latency_ms = None
+        with self.lock:
+            self._latest_sample = None
+            self._latest_timestamp = None
+            self._converted = (None, {})
 
     def _build_pipeline(self) -> str:
         caps = (
@@ -266,26 +313,28 @@ class RTPH265VideoInterface:
         decoded_at = time.monotonic()
 
         try:
-            frame = _sample_to_rgb(sample)
+            shape = _sample_shape(sample)
         except Exception:
-            self.logger.exception("Failed to convert decoded sample to RGB")
+            self.logger.exception("Decoded sample is not an RGB frame")
             return Gst.FlowReturn.OK
 
-        split_frames = self._split_frame(frame)
         self._update_decode_latency(decoded_at)
 
-        timestamp = time.time()
+        # Keep only a reference: the sample is converted when a consumer asks.
         with self.lock:
-            self.latest_images[self.camera_name] = frame
-            self.image_timestamps[self.camera_name] = timestamp
-            for name, split_frame in split_frames.items():
-                self.latest_images[name] = split_frame
-                self.image_timestamps[name] = timestamp
+            self._latest_sample = sample
+            self._latest_timestamp = time.time()
 
         now = time.monotonic()
         self._frame_count += 1
-        self._first_frame.set()
-        self._log_stats(frame, now)
+        if not self._first_frame.is_set():
+            self._first_frame.set()
+            # The RTP packet count only serves bring-up ("is anything arriving
+            # at all?"). Past the first frame it would cost ~1700 Python
+            # callbacks per second on the streaming thread.
+            if self._rtp_probe is not None:
+                self._rtp_probe.set_property("signal-handoffs", False)
+        self._log_stats(shape, now)
         return Gst.FlowReturn.OK
 
     def _on_rtp_packet(self, _identity: Gst.Element, _buffer: Gst.Buffer) -> None:
@@ -300,16 +349,15 @@ class RTPH265VideoInterface:
             return
         self._latest_decode_latency_ms = max(0.0, (decoded_at - self._decode_start_times.popleft()) * 1000.0)
 
-    def _split_frame(self, frame: np.ndarray) -> Dict[str, np.ndarray]:
+    def _crop(self, frame: np.ndarray, name: str) -> np.ndarray:
         height, width = frame.shape[:2]
-        crops: Dict[str, np.ndarray] = {}
-        for name, box in self.split_regions:
-            x1, y1, x2, y2 = _normalized_box_to_pixels(box, width, height)
-            if x2 > x1 and y2 > y1:
-                crops[name] = frame[y1:y2, x1:x2].copy()
-        return crops
+        box = dict(self.split_regions)[name]
+        x1, y1, x2, y2 = _normalized_box_to_pixels(box, width, height)
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(f"Split region {name!r} is empty for a {width}x{height} frame")
+        return frame[y1:y2, x1:x2].copy()
 
-    def _log_stats(self, frame: np.ndarray, now: float) -> None:
+    def _log_stats(self, shape: tuple[int, ...], now: float) -> None:
         if self._stats_start_time is None:
             self._stats_start_time = now
             self._last_log_time = now
@@ -329,13 +377,11 @@ class RTPH265VideoInterface:
 
         latency = "n/a" if self._latest_decode_latency_ms is None else f"{self._latest_decode_latency_ms:.1f} ms"
         self.logger.info(
-            "camera=%s frames=%d rtp_packets=%d h265_buffers=%d shape=%s fps=%.2f "
-            "overall_fps=%.2f decode_latency=%s",
+            "camera=%s frames=%d h265_buffers=%d shape=%s fps=%.2f overall_fps=%.2f decode_latency=%s",
             self.camera_name,
             self._frame_count,
-            self._rtp_packet_count,
             self._h265_buffer_count,
-            tuple(frame.shape),
+            shape,
             interval_fps,
             overall_fps,
             latency,
@@ -356,17 +402,22 @@ class RTPH265VideoInterface:
                 self._loop.quit()
 
 
-def _sample_to_rgb(sample: Gst.Sample) -> np.ndarray:
+def _sample_shape(sample: Gst.Sample) -> tuple[int, int, int]:
     caps = sample.get_caps()
     if caps is None or caps.get_size() == 0:
         raise RuntimeError("Decoded sample has no caps")
-
     structure = caps.get_structure(0)
-    width = int(structure.get_value("width"))
-    height = int(structure.get_value("height"))
     if structure.get_value("format") != "RGB":
         raise RuntimeError(f"Expected RGB sample, got {structure.get_value('format')}")
+    return int(structure.get_value("height")), int(structure.get_value("width")), 3
 
+
+def _with_mapped_rgb(sample: Gst.Sample, consume) -> None:
+    """Map the sample's buffer and hand `consume` an HWC uint8 view of it.
+
+    The view is only valid inside the call; `consume` must copy what it keeps.
+    """
+    height, width, _ = _sample_shape(sample)
     buffer = sample.get_buffer()
     if buffer is None:
         raise RuntimeError("Decoded sample has no buffer")
@@ -374,12 +425,13 @@ def _sample_to_rgb(sample: Gst.Sample) -> np.ndarray:
     ok, map_info = buffer.map(Gst.MapFlags.READ)
     if not ok:
         raise RuntimeError("Failed to map decoded frame buffer")
-
     try:
         row_bytes = width * 3
         raw = np.frombuffer(map_info.data, dtype=np.uint8)
         stride = raw.size // height if raw.size % height == 0 and raw.size // height >= row_bytes else row_bytes
-        return raw[: height * stride].reshape((height, stride))[:, :row_bytes].reshape((height, width, 3)).copy()
+        if raw.size < height * stride:
+            raise RuntimeError(f"Decoded buffer holds {raw.size} bytes, expected at least {height * stride}")
+        consume(raw[: height * stride].reshape((height, stride))[:, :row_bytes].reshape((height, width, 3)))
     finally:
         buffer.unmap(map_info)
 

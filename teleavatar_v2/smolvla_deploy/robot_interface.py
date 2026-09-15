@@ -2,28 +2,48 @@
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 import time
-from threading import Lock
 from typing import Optional
 
 import numpy as np
-import rclpy
 import yaml
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32
 
-from .contracts import build_state, gripper_position, map_smolvla_images, split_trigger_action
+from .contracts import (
+    SMOLVLA_CAMERA_MAPPING,
+    build_state,
+    gripper_position,
+    map_smolvla_images,
+    split_trigger_action,
+)
 from .rtp_video_interface import RTPH265VideoInterface
+
+JOINT_STATE_TOPICS = {
+    "left_arm": "/left_arm/joint_states",
+    "right_arm": "/right_arm/joint_states",
+    "left_gripper": "/left_gripper/joint_states",
+    "right_gripper": "/right_gripper/joint_states",
+}
 
 
 class TeleavatarSmolVLAInterface(Node):
-    """Thread-safe TeleAvatar V2 interface with SmolVLA-native action semantics."""
+    """TeleAvatar V2 interface with SmolVLA-native action semantics.
+
+    Not spun by an executor. The joint-state topics publish at 200Hz each, and
+    an executor thread delivering those 800 callbacks/s through Python held the
+    GIL often enough to double inference latency. Instead the control thread
+    calls `poll_sensors()` (done by every public method that reads sensors) and
+    takes the newest sample straight from the DDS reader, so no other Python
+    thread runs in this process besides the GStreamer streaming thread.
+    """
 
     LEFT_NAMES = [f"l_joint{i}" for i in range(1, 8)]
     RIGHT_NAMES = [f"r_joint{i}" for i in range(1, 8)]
+    POLICY_VIEWS = tuple(SMOLVLA_CAMERA_MAPPING.values())
 
     def __init__(
         self,
@@ -37,7 +57,6 @@ class TeleavatarSmolVLAInterface(Node):
         max_joint_step_rad: float = 0.0,
     ) -> None:
         super().__init__(node_name)
-        self._lock = Lock()
         self._sensor_timeout = float(sensor_timeout)
         self._max_joint_step_rad = float(max_joint_step_rad)
         self._joint_states: dict[str, JointState] = {}
@@ -58,30 +77,20 @@ class TeleavatarSmolVLAInterface(Node):
         self._video = RTPH265VideoInterface(port=rtp_port, payload=rtp_payload, decoder=decoder)
         self._video.start()
 
-        self.create_subscription(
-            JointState,
-            "/left_arm/joint_states",
-            lambda msg: self._on_joint_state("left_arm", msg),
-            10,
+        # Only the newest sample matters, so a history of one lets the DDS
+        # reader discard the rest without any Python involvement.
+        latest_only = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.RELIABLE
         )
-        self.create_subscription(
-            JointState,
-            "/right_arm/joint_states",
-            lambda msg: self._on_joint_state("right_arm", msg),
-            10,
-        )
-        self.create_subscription(
-            JointState,
-            "/left_gripper/joint_states",
-            lambda msg: self._on_joint_state("left_gripper", msg),
-            10,
-        )
-        self.create_subscription(
-            JointState,
-            "/right_gripper/joint_states",
-            lambda msg: self._on_joint_state("right_gripper", msg),
-            10,
-        )
+        self._joint_subscriptions = {
+            arm: self.create_subscription(
+                JointState,
+                topic,
+                lambda msg, arm=arm: self._store_joint_state(arm, msg),
+                latest_only,
+            )
+            for arm, topic in JOINT_STATE_TOPICS.items()
+        }
         self._arm_publishers = {
             "left_arm": self.create_publisher(JointState, "/api/left_arm/joint_cmd", 10),
             "right_arm": self.create_publisher(JointState, "/api/right_arm/joint_cmd", 10),
@@ -93,10 +102,27 @@ class TeleavatarSmolVLAInterface(Node):
         self._enable_publisher = self.create_publisher(Float32, "/api/fsm/enable", 10)
         self.get_logger().info("TeleAvatar SmolVLA interface initialized")
 
-    def _on_joint_state(self, arm: str, msg: JointState) -> None:
-        with self._lock:
-            self._joint_states[arm] = msg
-            self._joint_timestamps[arm] = time.time()
+    def _store_joint_state(self, arm: str, msg: JointState) -> None:
+        self._joint_states[arm] = msg
+        self._joint_timestamps[arm] = time.time()
+
+    def poll_sensors(self) -> None:
+        """Take the newest joint state from each DDS reader, if one arrived.
+
+        `take_message` is what rclpy's own executor calls once the wait set
+        reports a subscription ready; calling it directly skips the wait set
+        and the callback machinery.
+        """
+        for arm, subscription in self._joint_subscriptions.items():
+            latest = None
+            while True:
+                with subscription.handle:
+                    taken = subscription.handle.take_message(subscription.msg_type, subscription.raw)
+                if taken is None:
+                    break
+                latest = taken[0]
+            if latest is not None:
+                self._store_joint_state(arm, latest)
 
     @staticmethod
     def _ordered_positions(msg: JointState, expected_names: list[str]) -> np.ndarray:
@@ -111,15 +137,14 @@ class TeleavatarSmolVLAInterface(Node):
         return np.asarray(msg.position[:7], dtype=np.float32)
 
     def _sensor_failures(self, *, include_images: bool) -> list[str]:
+        self.poll_sensors()
         now = time.time()
         failures: list[str] = []
         if self._video.stream_ended():
             failures.append("RTP pipeline stopped")
 
-        with self._lock:
-            stamps = dict(self._joint_timestamps)
-        for arm in ("left_arm", "right_arm", "left_gripper", "right_gripper"):
-            stamp = stamps.get(arm)
+        for arm in JOINT_STATE_TOPICS:
+            stamp = self._joint_timestamps.get(arm)
             if stamp is None:
                 failures.append(f"{arm} not received")
             elif now - stamp > self._sensor_timeout:
@@ -127,7 +152,7 @@ class TeleavatarSmolVLAInterface(Node):
 
         if include_images:
             image_stamps = self._video.get_image_timestamps()
-            for view in ("head_left_eye", "left_wrist_left_eye", "right_wrist_left_eye"):
+            for view in self.POLICY_VIEWS:
                 stamp = image_stamps.get(view)
                 if stamp is None:
                     failures.append(f"{view} not received")
@@ -161,12 +186,12 @@ class TeleavatarSmolVLAInterface(Node):
             self.get_logger().error("Observation unavailable: " + "; ".join(failures))
             return None
 
-        split_images, _ = self._video.get_latest_images_with_timestamps()
-        with self._lock:
-            left_msg = self._joint_states["left_arm"]
-            right_msg = self._joint_states["right_arm"]
-            left_gripper_msg = self._joint_states["left_gripper"]
-            right_gripper_msg = self._joint_states["right_gripper"]
+        # Only the three views the policy consumes are cut from the frame.
+        split_images = self._video.get_views(self.POLICY_VIEWS)
+        left_msg = self._joint_states["left_arm"]
+        right_msg = self._joint_states["right_arm"]
+        left_gripper_msg = self._joint_states["left_gripper"]
+        right_gripper_msg = self._joint_states["right_gripper"]
         try:
             left = self._ordered_positions(left_msg, self.LEFT_NAMES)
             right = self._ordered_positions(right_msg, self.RIGHT_NAMES)
@@ -187,8 +212,7 @@ class TeleavatarSmolVLAInterface(Node):
         if self._max_joint_step_rad > 0:
             reference = self._last_arm_command.get(arm)
             if reference is None:
-                with self._lock:
-                    msg = self._joint_states.get(arm)
+                msg = self._joint_states.get(arm)
                 if msg is not None:
                     names = self.LEFT_NAMES if arm == "left_arm" else self.RIGHT_NAMES
                     reference = self._ordered_positions(msg, names)

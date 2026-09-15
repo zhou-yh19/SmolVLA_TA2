@@ -4,7 +4,6 @@
 import argparse
 from pathlib import Path
 import sys
-import threading
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -12,7 +11,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 import rclpy  # noqa: E402
-from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 
 from smolvla_deploy.robot_interface import TeleavatarSmolVLAInterface  # noqa: E402
 
@@ -24,11 +22,8 @@ def main() -> int:
     args = parser.parse_args()
 
     rclpy.init()
+    # The interface polls its subscriptions itself; no executor is needed.
     robot = TeleavatarSmolVLAInterface(arm_config=args.arm_config, rtp_port=args.rtp_port)
-    executor = MultiThreadedExecutor()
-    executor.add_node(robot)
-    thread = threading.Thread(target=executor.spin, daemon=True)
-    thread.start()
     try:
         if not robot.wait_for_initial_data(timeout=30.0):
             return 1
@@ -40,8 +35,6 @@ def main() -> int:
             print(f"{key}: shape={array.shape} dtype={array.dtype} range=[{array.min():.3f}, {array.max():.3f}]")
         return 0
     finally:
-        executor.shutdown()
-        thread.join(timeout=2.0)
         robot.destroy_node()
         rclpy.shutdown()
 

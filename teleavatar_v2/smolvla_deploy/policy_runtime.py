@@ -41,7 +41,15 @@ def load_policy_config(checkpoint_path: str | Path):
 
 
 class SmolVLARuntime:
-    """Load one checkpoint and infer complete chunks without an action queue."""
+    """Load one checkpoint and infer complete chunks without an action queue.
+
+    On CUDA the whole inference - uint8 frames in, unnormalized action chunk
+    out - is captured once into a CUDA graph and replayed afterwards. The
+    eager path launches a few thousand small kernels from Python per chunk, and
+    every launch has to reacquire the GIL; with the decoder and ROS2 callbacks
+    running in the same process that turned an 86ms inference into 150-280ms
+    with large jitter. A replay is one launch, so it is immune to that.
+    """
 
     def __init__(
         self,
@@ -56,6 +64,7 @@ class SmolVLARuntime:
         precision: str | None = None,
         attn_implementation: str = "sdpa",
         compile_model: bool = False,
+        cuda_graph: bool = True,
     ) -> None:
         repo = Path(smolvla_repo).expanduser().resolve()
         source = repo / "src"
@@ -146,16 +155,25 @@ class SmolVLARuntime:
             # the joint statistics the action chunk is unnormalized with.
             self.policy.model.to(dtype=self._compute_dtype)
         self._validate_normalization_statistics(self.policy)
+        self._cuda_graph_enabled = bool(cuda_graph) and self._device.type == "cuda"
+        self._graph: _CapturedInference | None = None
+        if compile_model and self._cuda_graph_enabled:
+            # A replay has no Python between kernels, which is all the compiled
+            # denoise step was buying; and a capture over dynamo-generated code
+            # fails on this stack. The graph wins on both counts.
+            logging.info("Ignoring --compile: the CUDA graph already removes the launch overhead")
+            compile_model = False
         if compile_model:
             self._compile_denoise_step()
         self.chunk_size = int(config.chunk_size)
         _ckpt_dtype = getattr(config, "model_dtype", "fp32(mixed-legacy)")
         logging.info(
-            "Loaded SmolVLA: device=%s dtype=%s attn=%s chunk_size=%d num_steps=%d action_dim=%d "
-            "(checkpoint stores state=%d action=%d)",
+            "Loaded SmolVLA: device=%s dtype=%s attn=%s cuda_graph=%s chunk_size=%d num_steps=%d "
+            "action_dim=%d (checkpoint stores state=%d action=%d)",
             self._device,
             self._compute_dtype or _ckpt_dtype,
             attn_implementation,
+            self._cuda_graph_enabled,
             self.chunk_size,
             int(config.num_steps),
             ACTION_DIM,
@@ -292,19 +310,16 @@ class SmolVLARuntime:
         if normalization_tensors == 0:
             logging.warning("Policy has no non-identity normalization statistics to validate")
 
-    def _make_batch(self, observation: dict, task: str) -> dict:
-        torch = self._torch
+    def _validate_observation(self, observation: dict) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Check shapes and return the padded state and the HWC frames, still on the host."""
         state = np.asarray(observation[OBS_STATE], dtype=np.float32)
         if state.shape != (STATE_DIM,):
             raise ValueError(f"Expected state ({STATE_DIM},), got {state.shape}")
         # A checkpoint trained on several datasets normalizes a padded state, so
         # the buffers are `max_state_dim` wide and a bare 14-D tensor would not
         # broadcast against them.
-        state = pad_to_width(state, self._state_width)
-        batch = {
-            OBS_STATE: torch.from_numpy(np.ascontiguousarray(state)).unsqueeze(0).to(self._device),
-            "task": task,
-        }
+        state = np.ascontiguousarray(pad_to_width(state, self._state_width))
+        images: dict[str, np.ndarray] = {}
         for key in (OBS_IMAGE, OBS_IMAGE_2, OBS_IMAGE_3):
             image = np.asarray(observation[key])
             if image.ndim != 3 or image.shape[-1] != 3:
@@ -327,7 +342,17 @@ class SmolVLARuntime:
                     trained_hw[0],
                     trained_hw[1],
                 )
-            tensor = torch.from_numpy(np.ascontiguousarray(image))
+            images[key] = np.ascontiguousarray(image)
+        return state, images
+
+    def _make_batch(self, state: np.ndarray, images: dict[str, np.ndarray], task: str) -> dict:
+        torch = self._torch
+        batch = {
+            OBS_STATE: torch.from_numpy(state).unsqueeze(0).to(self._device),
+            "task": task,
+        }
+        for key, image in images.items():
+            tensor = torch.from_numpy(image)
             if tensor.dtype == torch.uint8:
                 # Send the 8-bit frame across PCIe and widen it on the GPU: a
                 # quarter of the bytes of an fp32 conversion done host-side, for
@@ -340,11 +365,40 @@ class SmolVLARuntime:
             batch[key] = tensor.unsqueeze(0)
         return batch
 
+    def _finish_chunk(self, chunk: np.ndarray, marks: list[tuple[str, float]]) -> tuple[np.ndarray, float]:
+        elapsed_ms = (time.monotonic() - marks[0][1]) * 1000.0
+        if self._profile_inference:
+            parts = []
+            for (prev_name, prev_time), (name, current_time) in zip(
+                marks[:-1], marks[1:], strict=True
+            ):
+                parts.append(f"{prev_name}->{name}={(current_time - prev_time) * 1000.0:.1f}ms")
+            logging.info("inference profile: %s total=%.1fms", " ".join(parts), elapsed_ms)
+        if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM or not np.isfinite(chunk).all():
+            raise RuntimeError(f"Policy returned an invalid action chunk: {chunk.shape}")
+        return chunk, elapsed_ms
+
     def infer_action_chunk(self, observation: dict, task: str) -> tuple[np.ndarray, float]:
         """Return unnormalized direct-trigger actions with shape [T, 16]."""
-        torch = self._torch
         marks: list[tuple[str, float]] = [("start", time.monotonic())]
-        batch = self._make_batch(observation, task)
+        state, images = self._validate_observation(observation)
+        self._profile_mark(marks, "validate")
+        if self._cuda_graph_enabled and all(image.dtype == np.uint8 for image in images.values()):
+            graph = self._captured_inference(state, images, task)
+            return self._finish_chunk(graph.run(state, images, marks), marks)
+        return self._finish_chunk(self._infer_eager(state, images, task, marks), marks)
+
+    def _infer_eager(
+        self,
+        state: np.ndarray,
+        images: dict[str, np.ndarray],
+        task: str,
+        marks: list[tuple[str, float]],
+        noise=None,
+    ) -> np.ndarray:
+        """Kernel-by-kernel inference; `noise` overrides the sampled flow noise (tests, graph check)."""
+        torch = self._torch
+        batch = self._make_batch(state, images, task)
         self._profile_mark(marks, "make_batch")
         amp = (
             torch.autocast(device_type=self._device.type)
@@ -366,6 +420,7 @@ class SmolVLARuntime:
                 language_tokens,
                 language_masks,
                 state,
+                noise=None if noise is None else noise.clone(),
             )
             self._profile_mark(marks, "sample")
             # `sample_actions` always emits `max_action_dim` columns, so narrow
@@ -376,14 +431,213 @@ class SmolVLARuntime:
             actions = actions[:, :, :ACTION_DIM]
         chunk = actions[0].detach().to(dtype=torch.float32, device="cpu").numpy()
         self._profile_mark(marks, "cpu")
-        elapsed_ms = (time.monotonic() - marks[0][1]) * 1000.0
-        if self._profile_inference:
-            parts = []
-            for (prev_name, prev_time), (name, current_time) in zip(
-                marks[:-1], marks[1:], strict=True
-            ):
-                parts.append(f"{prev_name}->{name}={(current_time - prev_time) * 1000.0:.1f}ms")
-            logging.info("inference profile: %s total=%.1fms", " ".join(parts), elapsed_ms)
-        if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM or not np.isfinite(chunk).all():
-            raise RuntimeError(f"Policy returned an invalid action chunk: {chunk.shape}")
-        return chunk, elapsed_ms
+        return chunk
+
+    # --- CUDA graph path ----------------------------------------------------
+
+    def _captured_inference(
+        self, state: np.ndarray, images: dict[str, np.ndarray], task: str
+    ) -> "_CapturedInference":
+        """The graph for these input shapes and task, capturing it first if needed."""
+        signature = (task, tuple((key, image.shape) for key, image in images.items()))
+        graph = self._graph
+        if graph is not None and graph.signature == signature:
+            return graph
+        if graph is not None:
+            logging.warning("Observation shapes or task changed; re-capturing the inference graph")
+            self._graph = None
+        try:
+            self._graph = _CapturedInference(self, signature, state, images, task)
+        except Exception as error:
+            # Not recoverable in-process: an aborted capture leaves the CUDA RNG
+            # registered to a graph that never finished, and the eager path
+            # then fails on its first `torch.normal`. Failing here happens in
+            # the runner's warm-up, before anything is published.
+            raise RuntimeError(
+                "CUDA graph capture failed. Re-run with --no-cuda-graph to use the eager path, "
+                "which is several times slower under load."
+            ) from error
+        return self._graph
+
+    def _graph_forward(
+        self, images_u8: dict[str, object], state: object, language: tuple[object, object], noise: object
+    ) -> object:
+        """Device frames and state in, [chunk_size, ACTION_DIM] fp32 actions out.
+
+        The same maths as `_infer_eager`, minus everything that would break a
+        capture: the host-side `isinf` asserts inside the normalization
+        modules and the pageable host-to-device copies of `_make_batch`.
+        """
+        torch = self._torch
+        policy = self.policy
+        batch = {OBS_STATE: state}
+        for key, tensor in images_u8.items():
+            batch[key] = (
+                tensor.permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0).unsqueeze(0)
+            )
+        batch = _apply_normalization(policy.normalize_inputs, batch, inverse=False)
+        # Same autocast decision as the eager path (a checkpoint with use_amp
+        # runs its fp32 projections in bf16 there too). The cast cache is off
+        # because it would pin weight copies allocated inside the capture.
+        amp = (
+            torch.autocast(device_type=self._device.type, cache_enabled=False)
+            if self._use_amp
+            else nullcontext()
+        )
+        with amp:
+            images, image_masks = policy.prepare_images(batch)
+            prepared_state = policy.prepare_state(batch)
+            language_tokens, language_masks = language
+            # `sample_actions` integrates in place on the tensor it is handed, so
+            # give it a copy and keep the static noise buffer as a pure input.
+            actions = policy.model.sample_actions(
+                images, image_masks, language_tokens, language_masks, prepared_state, noise=noise.clone()
+            )
+            actions = actions[:, :, : self._action_width]
+            actions = _apply_normalization(policy.unnormalize_outputs, {"action": actions}, inverse=True)["action"]
+        return actions[0, :, :ACTION_DIM].to(dtype=torch.float32)
+
+
+def _apply_normalization(module, batch: dict, *, inverse: bool) -> dict:
+    """`Normalize.forward` / `Unnormalize.forward` without their host-synchronizing asserts.
+
+    The statistics were already checked for infinities when the checkpoint was
+    loaded (`_validate_normalization_statistics`), and a CUDA graph cannot
+    contain the `.any()` those asserts evaluate on the host.
+    """
+    from lerobot.configs.types import NormalizationMode
+
+    batch = dict(batch)
+    for key, feature in module.features.items():
+        if key not in batch:
+            continue
+        mode = module.norm_map.get(feature.type, NormalizationMode.IDENTITY)
+        if mode is NormalizationMode.IDENTITY:
+            continue
+        buffer = getattr(module, "buffer_" + key.replace(".", "_"))
+        if mode is NormalizationMode.MEAN_STD:
+            mean, std = buffer["mean"], buffer["std"]
+            if inverse:
+                batch[key] = batch[key] * std + mean
+            else:
+                batch[key] = (batch[key] - mean) / (std + 1e-8)
+        elif mode is NormalizationMode.MIN_MAX:
+            low, high = buffer["min"], buffer["max"]
+            if inverse:
+                batch[key] = (batch[key] + 1) / 2
+                batch[key] = batch[key] * (high - low) + low
+            else:
+                batch[key] = (batch[key] - low) / (high - low + 1e-8)
+                batch[key] = batch[key] * 2 - 1
+        else:
+            raise ValueError(mode)
+    return batch
+
+
+class _CapturedInference:
+    """One CUDA graph over `SmolVLARuntime._graph_forward` with static I/O buffers."""
+
+    # Warm-up passes on a side stream before capture: cuBLAS/cuDNN allocate
+    # their workspaces and pick kernels lazily, which is not capturable.
+    WARMUP_PASSES = 3
+    # The graph must reproduce the eager path. Actions are joint angles in
+    # radians and the two paths run the same kernels, so anything visible here
+    # is a logic error, not rounding.
+    MAX_ABS_DIFFERENCE = 1e-3
+
+    def __init__(
+        self,
+        runtime: SmolVLARuntime,
+        signature: tuple,
+        state: np.ndarray,
+        images: dict[str, np.ndarray],
+        task: str,
+    ) -> None:
+        torch = runtime._torch
+        self._torch = torch
+        self._runtime = runtime
+        self._device = runtime._device
+        self.signature = signature
+        started = time.monotonic()
+
+        # Pinned staging buffers make the per-chunk uploads asynchronous DMA
+        # instead of the synchronous pageable copies `torch.from_numpy(...).to()` does.
+        self._host_images = {
+            key: torch.empty(image.shape, dtype=torch.uint8).pin_memory() for key, image in images.items()
+        }
+        self._device_images = {
+            key: torch.empty(image.shape, dtype=torch.uint8, device=self._device)
+            for key, image in images.items()
+        }
+        self._host_state = torch.empty((1, state.shape[0]), dtype=torch.float32).pin_memory()
+        self._device_state = torch.empty((1, state.shape[0]), dtype=torch.float32, device=self._device)
+        config = runtime.policy.config
+        self._noise = torch.empty(
+            (1, int(config.chunk_size), int(config.max_action_dim)), dtype=torch.float32, device=self._device
+        )
+        self._upload(state, images)
+        self._noise.normal_()
+        language = runtime._prepare_language_cached({OBS_STATE: self._device_state, "task": task}, task)
+
+        forward = lambda: runtime._graph_forward(  # noqa: E731
+            self._device_images, self._device_state, language, self._noise
+        )
+        side_stream = torch.cuda.Stream(device=self._device)
+        side_stream.wait_stream(torch.cuda.current_stream(self._device))
+        with torch.cuda.stream(side_stream), torch.inference_mode():
+            for _ in range(self.WARMUP_PASSES):
+                forward()
+        torch.cuda.current_stream(self._device).wait_stream(side_stream)
+        torch.cuda.synchronize(self._device)
+
+        # "thread_local": only this thread's CUDA calls are checked. The default
+        # "global" mode invalidates the capture when any other thread in the
+        # process touches CUDA, and the H.265 decoder does exactly that from
+        # the GStreamer streaming thread throughout.
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph, capture_error_mode="thread_local"), torch.inference_mode():
+            self._device_output = forward()
+        torch.cuda.synchronize(self._device)
+
+        self._verify_against_eager(state, images, task)
+        logging.info(
+            "Captured the inference CUDA graph in %.1fs: images=%s state=%d",
+            time.monotonic() - started,
+            ", ".join(f"{key.rsplit('.', 1)[-1]}={tuple(image.shape)}" for key, image in images.items()),
+            state.shape[0],
+        )
+
+    def _upload(self, state: np.ndarray, images: dict[str, np.ndarray]) -> None:
+        torch = self._torch
+        for key, image in images.items():
+            self._host_images[key].copy_(torch.from_numpy(image))
+            self._device_images[key].copy_(self._host_images[key], non_blocking=True)
+        self._host_state[0].copy_(torch.from_numpy(state))
+        self._device_state.copy_(self._host_state, non_blocking=True)
+
+    def _verify_against_eager(self, state: np.ndarray, images: dict[str, np.ndarray], task: str) -> None:
+        """Replay once and compare with the eager path on the same noise."""
+        runtime = self._runtime
+        expected = runtime._infer_eager(state, images, task, [("start", time.monotonic())], noise=self._noise)
+        self._graph.replay()
+        actual = self._device_output.cpu().numpy()
+        difference = float(np.abs(actual - expected).max())
+        if not np.isfinite(actual).all() or difference > self.MAX_ABS_DIFFERENCE:
+            raise RuntimeError(
+                f"CUDA graph output differs from the eager path (max abs difference {difference:.3e})"
+            )
+        logging.info("CUDA graph matches the eager path: max abs difference %.2e", difference)
+
+    def run(self, state: np.ndarray, images: dict[str, np.ndarray], marks: list[tuple[str, float]]) -> np.ndarray:
+        runtime = self._runtime
+        with self._torch.inference_mode():
+            self._upload(state, images)
+            self._noise.normal_()
+            runtime._profile_mark(marks, "upload")
+            self._graph.replay()
+            runtime._profile_mark(marks, "replay")
+            # The host copy waits for the replay; `_upload` may then reuse the
+            # pinned buffers on the next call because everything before it is done.
+            chunk = self._device_output.cpu().numpy()
+        runtime._profile_mark(marks, "cpu")
+        return chunk

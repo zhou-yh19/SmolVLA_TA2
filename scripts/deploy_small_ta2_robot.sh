@@ -8,6 +8,7 @@
 # Run it on the ROBOT host, not the training server. Stages:
 #   ./scripts/deploy_small_ta2_robot.sh check     # env + checkpoint, no ROS
 #   ./scripts/deploy_small_ta2_robot.sh bench     # time inference on random data, no ROS
+#   ./scripts/deploy_small_ta2_robot.sh diagnose  # time inference under live decoder/ROS load, no commands
 #   ./scripts/deploy_small_ta2_robot.sh cameras   # decode RTP, save six crops
 #   ./scripts/deploy_small_ta2_robot.sh observe   # print the exact observation
 #   ./scripts/deploy_small_ta2_robot.sh zero      # move both arms to zero
@@ -24,14 +25,14 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DEPLOY_ROOT="${DEPLOY_ROOT:-${PROJECT_ROOT}/teleavatar_v2}"
 CONDA_ENV="${CONDA_ENV:-teleavatar-smolvla}"
 
-EXP_NAME="${EXP_NAME:-smolvla_ta2_multi_run06}"
+EXP_NAME="${EXP_NAME:-smolvla_ta2_catch_01}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/${EXP_NAME}}"
 
 # Which checkpoint to deploy. SAVE_FREQ was 2000, so run03 has 002000, 004000,
 # ... 010000 plus "last". Training loss flattened by ~2000 steps and the run
 # went to 10000 with no validation set, so the late checkpoints are the ones
 # most likely to have overfit 4695 frames. Start at 002000 and walk forward.
-CKPT_STEP="${CKPT_STEP:-016000}"
+CKPT_STEP="${CKPT_STEP:-010000}"
 CHECKPOINT="${CHECKPOINT:-${OUTPUT_DIR}/checkpoints/${CKPT_STEP}/pretrained_model}"
 
 # The VLM config/processor must already be on this host: deployment loads the
@@ -42,7 +43,7 @@ VLM_LOCAL_DIR="${VLM_LOCAL_DIR:-${PROJECT_ROOT}/weights/${VLM_REPO_ID}}"
 # --- Policy / control -----------------------------------------------------
 # The language instruction. It MUST match the phrasing used in the training
 # episodes: the policy conditions on it and an unseen phrasing degrades it.
-TASK="${TASK:-a base layer is already in place, pick left-side block with the left arm and right-side block with the right arm, place block on the base layer.}"
+TASK="${TASK:-catch the rolling ball or bottle and put it in the basket.}"
 DEVICE="${DEVICE:-cuda}"
 # SmolVLA flow denoising steps. The checkpoint default is normally 10. Lower
 # values cut inference time nearly linearly; validate quality on hardware.
@@ -52,20 +53,27 @@ PROFILE_INFERENCE="${PROFILE_INFERENCE:-0}"
 # dtype layout it was trained with (matches training exactly). Explicit fp32/bf16/fp16
 # forces all backbone weights to that dtype after loading; only use this to
 # override the checkpoint intentionally or to test numerics.
-PRECISION="${PRECISION:-}"
+PRECISION="${PRECISION:-fp32}"
 # Attention kernel: sdpa (fused, deployment default) or eager (matches training).
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
-# torch.compile the denoise step. Fuses the per-step expert pass, which cuts the
-# Python-side kernel launches the control loop is otherwise starved on: measured
-# 274ms -> 160ms median per chunk with the cameras and arms streaming. The
-# runner absorbs the one-off compilation in its warmup, before the control loop.
-COMPILE_MODEL="${COMPILE_MODEL:-1}"
+# Capture the whole inference (frames in, action chunk out) into one CUDA graph
+# at warm-up and replay it per chunk. The eager path launches thousands of small
+# kernels from Python and each launch has to win the GIL back from the decoder
+# and ROS2 callbacks in the same process; measured with cameras and arms live:
+# 211ms median (143-269ms) eager vs 36ms (35-37ms) replayed. The replay is
+# checked against the eager path at capture time and refuses to run if the two
+# disagree. Set to 0 only to diagnose a capture problem.
+CUDA_GRAPH="${CUDA_GRAPH:-1}"
+# torch.compile the denoise step. Only relevant with CUDA_GRAPH=0: a replay has
+# no Python between kernels, which is all compilation was buying, and the two
+# do not combine on this stack (the runtime ignores --compile under the graph).
+COMPILE_MODEL="${COMPILE_MODEL:-0}"
 # Timed iterations for the 'bench' stage.
-BENCH_ITERS="${BENCH_ITERS:-20}"
+BENCH_ITERS="${BENCH_ITERS:-50}"
 
 # Actions are executed open-loop at this rate. The dataset is 30fps; 20Hz
 # leaves headroom for inference between chunks.
-CONTROL_FREQUENCY="${CONTROL_FREQUENCY:-20}"
+CONTROL_FREQUENCY="${CONTROL_FREQUENCY:-30}"
 # Of the 50 predicted actions, execute this many, then replan from a fresh
 # observation. Smaller = more reactive and more inference; larger = smoother
 # but longer blind. 16 at 20Hz replans every 0.8s.
@@ -79,7 +87,7 @@ MAX_JOINT_STEP_RAD="${MAX_JOINT_STEP_RAD:-0.05}"
 MAX_CHUNKS="${MAX_CHUNKS:-0}"
 
 # --- ROS2 -----------------------------------------------------------------
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-19}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-29}"
 export ROS_DISTRO="${ROS_DISTRO:-humble}"
 RTP_PORT="${RTP_PORT:-8890}"
 CAMERA_DUMP_DIR="${CAMERA_DUMP_DIR:-${OUTPUT_DIR}/teleavatar_cameras}"
@@ -285,10 +293,36 @@ bench)
     [[ -n "${NUM_STEPS}" ]] && bench_args+=(--num-steps "${NUM_STEPS}")
     [[ -n "${PRECISION}" ]] && bench_args+=(--precision "${PRECISION}")
     bench_args+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
+    [[ "${CUDA_GRAPH}" != "1" ]] && bench_args+=(--no-cuda-graph)
     [[ "${COMPILE_MODEL}" == "1" ]] && bench_args+=(--compile)
     [[ "${PROFILE_INFERENCE}" == "1" ]] && bench_args+=(--profile-inference)
 
     exec python scripts/bench_inference.py "${bench_args[@]}"
+    ;;
+
+diagnose)
+    # Attributes any gap between 'bench' and 'run': the same inference is timed
+    # back-to-back, with the control loop's idle gap, with the live decoder,
+    # with an executor thread spinning the joint topics, and with the full
+    # robot interface. Publishes nothing. Needs the stream and topics live.
+    check_checkpoint
+    resolve_vlm_flag
+    diag_args=(
+        --checkpoint "${CHECKPOINT}"
+        --smolvla-repo "${PROJECT_ROOT}"
+        "${VLM_FLAG[@]}"
+        --device "${DEVICE}"
+        --task "${TASK}"
+        --gap-s "$(python -c "print(${EXECUTION_HORIZON} / ${CONTROL_FREQUENCY})")"
+        --rtp-port "${RTP_PORT}"
+        --arm-config "${DEPLOY_ROOT}/arm_config.yml"
+    )
+    [[ -n "${NUM_STEPS}" ]] && diag_args+=(--num-steps "${NUM_STEPS}")
+    [[ -n "${PRECISION}" ]] && diag_args+=(--precision "${PRECISION}")
+    diag_args+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
+    [[ "${CUDA_GRAPH}" != "1" ]] && diag_args+=(--no-cuda-graph)
+    [[ "${COMPILE_MODEL}" == "1" ]] && diag_args+=(--compile)
+    exec python scripts/diagnose_latency.py "${diag_args[@]}"
     ;;
 
 cameras)
@@ -337,6 +371,7 @@ dry|run)
     [[ -n "${NUM_STEPS}" ]] && run_args+=(--num-steps "${NUM_STEPS}")
     [[ -n "${PRECISION}" ]] && run_args+=(--precision "${PRECISION}")
     run_args+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
+    [[ "${CUDA_GRAPH}" != "1" ]] && run_args+=(--no-cuda-graph)
     [[ "${COMPILE_MODEL}" == "1" ]] && run_args+=(--compile)
     [[ "${PROFILE_INFERENCE}" == "1" ]] && run_args+=(--profile-inference)
     [[ "${MAX_CHUNKS}" != "0" ]] && run_args+=(--max-chunks "${MAX_CHUNKS}")
@@ -346,8 +381,14 @@ dry|run)
     if [[ "${STAGE}" == "dry" ]]; then
         # No --execute: infers one chunk, logs shape and triggers, exits without
         # publishing. Check that both trigger values sit inside [0,1] and are not
-        # pinned at a constant before enabling execution.
-        echo "[info] DRY RUN: one chunk, no commands published"
+        # pinned at a constant before enabling execution. With MAX_CHUNKS=N it
+        # instead keeps the loop's real cadence for N chunks, still publishing
+        # nothing: a soak test of inference latency with the arms untouched.
+        if [[ "${MAX_CHUNKS}" != "0" ]]; then
+            echo "[info] DRY RUN: ${MAX_CHUNKS} chunks at the control-loop cadence, no commands published"
+        else
+            echo "[info] DRY RUN: one chunk, no commands published"
+        fi
         exec python scripts/run_smolvla.py "${run_args[@]}"
     fi
 
@@ -365,7 +406,7 @@ dry|run)
 
 *)
     echo "[error] unknown stage '${STAGE}'" >&2
-    echo "[info] stages: check | bench | cameras | observe | zero | dry | run" >&2
+    echo "[info] stages: check | bench | diagnose | cameras | observe | zero | dry | run" >&2
     exit 1
     ;;
 esac

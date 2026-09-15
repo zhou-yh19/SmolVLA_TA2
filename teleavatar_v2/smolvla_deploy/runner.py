@@ -5,11 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-import threading
 import time
 
 import rclpy
-from rclpy.executors import SingleThreadedExecutor
 
 from .contracts import select_execution_actions
 from .policy_runtime import SmolVLARuntime
@@ -59,6 +57,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="torch.compile the denoise step. Costs compilation time on the first chunk.",
     )
+    parser.add_argument(
+        "--no-cuda-graph",
+        dest="cuda_graph",
+        action="store_false",
+        help="Run the eager kernel-by-kernel path instead of replaying one CUDA graph per chunk.",
+    )
     parser.add_argument("--control-frequency", type=float, default=20.0)
     parser.add_argument("--execution-horizon", type=int, default=16)
     parser.add_argument("--sensor-timeout", type=float, default=1.0)
@@ -75,7 +79,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="Actually publish robot commands. Without this flag, run one inference chunk and exit.",
+        help="Actually publish robot commands. Without this flag, run one inference chunk and exit "
+        "(or --max-chunks chunks at the real cadence, publishing nothing).",
     )
     parser.add_argument("--max-chunks", type=int, default=0, help="Stop after N chunks; 0 means unlimited")
     parser.add_argument(
@@ -126,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         precision=args.precision,
         attn_implementation=args.attn_implementation,
         compile_model=args.compile_model,
+        cuda_graph=args.cuda_graph,
     )
 
     rclpy.init()
@@ -137,27 +143,21 @@ def main(argv: list[str] | None = None) -> int:
         sensor_timeout=args.sensor_timeout,
         max_joint_step_rad=args.max_joint_step_rad,
     )
-    # Single-threaded on purpose. `MultiThreadedExecutor()` defaults to
-    # `multiprocessing.cpu_count()` threads, and every one of them competes for
-    # the GIL with the inference thread, which spends its time launching many
-    # small kernels from Python. Measured on a 24-thread host with the cameras
-    # streaming: 342ms median / 961ms worst chunk multi-threaded against 274ms /
-    # 307ms single-threaded, for four subscriptions whose callbacks only take a
-    # lock and store the message.
-    executor = SingleThreadedExecutor()
-    executor.add_node(robot)
-    spin_thread = threading.Thread(target=executor.spin, name="ros2-executor", daemon=True)
-    spin_thread.start()
+    # No executor, deliberately. The node polls its subscriptions from this
+    # thread whenever it reads sensors; an executor thread delivering 800
+    # joint-state callbacks/s competed with inference for the GIL (measured:
+    # 86ms -> 168ms median per chunk from that thread alone).
 
     chunk_count = 0
     try:
         if not robot.wait_for_initial_data(timeout=30.0):
             return 2
 
-        # CUDA's first-call setup and, under --compile, dynamo's compilation both
-        # land on whichever inference runs first. Spend them here: on chunk 1 a
-        # 30s+ compile would leave the arms holding the previous command well
-        # past the chunk budget. Nothing is published from these.
+        # CUDA's first-call setup, the CUDA graph capture and, under --compile,
+        # dynamo's compilation all land on whichever inference runs first.
+        # Spend them here: on chunk 1 they would leave the arms holding the
+        # previous command well past the chunk budget. Nothing is published
+        # from these.
         for index in range(args.warmup_chunks):
             observation = robot.get_observation()
             if observation is None:
@@ -185,7 +185,10 @@ def main(argv: list[str] | None = None) -> int:
                 actions[0, 15],
             )
 
-            if not args.execute:
+            # A dry run infers one chunk and leaves, unless --max-chunks asks it
+            # to keep the loop's real cadence (sensor checks, tick timing) for
+            # longer without ever publishing: a soak test with the arms still.
+            if not args.execute and not args.max_chunks:
                 return 0
 
             period = 1.0 / args.control_frequency
@@ -193,7 +196,8 @@ def main(argv: list[str] | None = None) -> int:
             for action in actions:
                 if not robot.sensors_healthy():
                     raise RuntimeError("Sensor became stale while executing an action chunk")
-                robot.publish_trigger_action(action)
+                if args.execute:
+                    robot.publish_trigger_action(action)
                 deadline += period
                 _wait_for_tick(deadline)
 
@@ -202,8 +206,6 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logging.info("Stopped by user")
     finally:
-        executor.shutdown()
-        spin_thread.join(timeout=2.0)
         robot.destroy_node()
         rclpy.shutdown()
     return 0

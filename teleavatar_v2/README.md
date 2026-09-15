@@ -141,9 +141,24 @@ python scripts/bench_inference.py \
 
 It reports the latency distribution and how much of the chunk budget
 (`execution_horizon / control_frequency`) the p90 consumes. Add
-`--profile-inference` to see where the time goes; on this policy essentially
-all of it is `sample_actions`, which costs a fixed prefix pass plus
-`--num-steps` denoising steps.
+`--profile-inference` to see where the time goes.
+
+On CUDA the runtime captures the whole inference — uint8 frames and state in,
+unnormalized action chunk out — into one CUDA graph during the first (warm-up)
+inference and replays it afterwards. At capture time it replays once and
+compares the result with the eager path on the same noise; it refuses to start
+if they differ. The graph is what makes `bench` numbers transfer to `run`: the
+eager path launches a few thousand small kernels from Python per chunk and
+every launch has to reacquire the GIL, so with the H.265 decoder and ROS2
+traffic in the same process it measured 211ms median with 143–269ms jitter
+against 86ms on the bench; a replay is one launch and measured 36ms either way.
+
+If `bench` and `run` still disagree, `scripts/diagnose_latency.py` (the
+`diagnose` stage of the deploy script) times the same inference back-to-back,
+with the control loop's idle gap, with the live decoder, with an executor thread
+spinning the joint-state topics, and with the full robot interface, and
+publishes nothing. Each condition's median tells you which component is
+stealing the time.
 
 Check ROS topics:
 
@@ -181,7 +196,10 @@ python scripts/run_smolvla.py \
   --task "stack the three blocks"
 ```
 
-To diagnose latency, run a dry pass with per-stage timing:
+To diagnose latency, run a dry pass with per-stage timing; with `--max-chunks N`
+the dry pass keeps the control loop's real cadence (sensor checks, tick timing)
+for N chunks without ever publishing, which is how to soak-test inference with
+the arms untouched:
 
 ```bash
 python scripts/run_smolvla.py \
@@ -189,7 +207,7 @@ python scripts/run_smolvla.py \
   --smolvla-repo /path/to/SmolVLA_TA2 \
   --device cuda \
   --task "stack the three blocks" \
-  --profile-inference
+  --profile-inference --max-chunks 60
 ```
 
 For speed/quality A/B tests, reduce the flow denoising steps from the
@@ -212,7 +230,8 @@ python scripts/run_smolvla.py \
 | `--precision {fp32,bf16,fp16}` | `PRECISION` | empty (no conversion) | post-load dtype override. Empty (the default) loads the checkpoint as stored, which is correct for both old mixed-dtype checkpoints and new uniform ones trained with `MODEL_DTYPE=bf16`. Set explicitly only to test numerics or force a specific dtype. |
 | `--attn-implementation {sdpa,eager}` | `ATTN_IMPLEMENTATION` | `sdpa` | `sdpa` uses the fused kernel; `eager` materializes the full score matrix and matches training exactly. |
 | `--num-steps N` | `NUM_STEPS` | checkpoint value (10) | flow denoising steps. Time is roughly linear in this; quality is not — validate on hardware. |
-| `--compile` | `COMPILE_MODEL=1` | off | `torch.compile` the denoise step. The first chunk pays compilation. |
+| `--no-cuda-graph` | `CUDA_GRAPH=0` | graph on | run the eager kernel-by-kernel path instead of replaying one CUDA graph per chunk. Several times slower under decoder/ROS load; only for diagnosing a capture problem. |
+| `--compile` | `COMPILE_MODEL=1` | off | `torch.compile` the denoise step on the eager path. Ignored under the CUDA graph, which already removes the launch overhead. |
 | `--profile-inference` | `PROFILE_INFERENCE=1` | off | per-stage timing on every chunk. |
 | `--iters N` | `BENCH_ITERS` | 20 | timed iterations, `bench` only. |
 
@@ -274,6 +293,24 @@ The runtime intentionally implements full-chunk inference itself. It does not
 call the repository's currently broken `predict_action_chunk()` path and does
 not use `select_action()`, whose internal queue would conflict with replanning
 after the chosen execution horizon.
+
+## Process layout
+
+Everything runs in one process, and the design keeps Python out of the way of
+the inference thread:
+
+- The GStreamer streaming thread only stores a reference to the newest decoded
+  sample; RGB conversion and the crops are cut on demand by whoever asks
+  (`RTPH265VideoInterface.get_views`), and the policy asks for exactly the three
+  views it consumes, about once per chunk instead of 45 times per second. The
+  per-RTP-packet probe is switched off after the first decoded frame.
+- The ROS2 node is not spun by an executor. The control thread polls the four
+  joint-state subscriptions (`poll_sensors`, called by every sensor-reading
+  method) and takes the newest sample straight from the DDS reader, which keeps
+  a history of one. An executor thread delivering 800 callbacks/s through Python
+  held the GIL often enough to double inference latency.
+- Inference is one CUDA graph replay (see above), so what little Python does run
+  concurrently cannot stretch it.
 
 ## Offline contract tests
 

@@ -940,6 +940,27 @@ class VLAFlowMatching(nn.Module):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
 
+    def _device_constant(self, key, data, dtype, device) -> torch.Tensor:
+        """A host-defined constant tensor, uploaded once per (value, dtype, device).
+
+        The prefix/suffix attention layouts and the image-embedding scale are
+        fixed by the config, yet were rebuilt with `torch.tensor(..., device=)`
+        on every forward: a pageable host-to-device copy that synchronizes the
+        stream and is not permitted inside a CUDA graph capture. The cached
+        tensor is what `torch.tensor` would have produced, so the maths is
+        unchanged; only the upload is skipped.
+        """
+        cache = self.__dict__.setdefault("_device_constants", {})
+        cache_key = (key, dtype, str(device))
+        tensor = cache.get(cache_key)
+        if tensor is None:
+            if isinstance(data, torch.Tensor):
+                tensor = data.to(device=device, dtype=dtype)
+            else:
+                tensor = torch.tensor(data, dtype=dtype, device=device)
+            cache[cache_key] = tensor
+        return tensor
+
     def sample_noise(self, shape, device):
         noise = torch.normal(
             mean=0.0,
@@ -1003,7 +1024,9 @@ class VLAFlowMatching(nn.Module):
         # Concatenate all embeddings
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = self._device_constant(
+            ("prefix_att_masks", tuple(att_masks)), att_masks, torch.bool, pad_masks.device
+        )
 
         # Handle prefix length padding
         seq_len = pad_masks.shape[1]
@@ -1025,7 +1048,12 @@ class VLAFlowMatching(nn.Module):
             if self.add_image_special_tokens:
                 start_emb = (
                     self.vlm_with_expert.embed_language_tokens(
-                        self.global_image_start_token.to(device=img.device)
+                        self._device_constant(
+                            "global_image_start_token",
+                            self.global_image_start_token,
+                            torch.long,
+                            img.device,
+                        )
                     )
                     .unsqueeze(0)
                     .expand(img.shape[0], -1, -1)
@@ -1041,7 +1069,9 @@ class VLAFlowMatching(nn.Module):
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+            img_emb = img_emb * self._device_constant(
+                ("image_embedding_scale", img_emb_dim), img_emb_dim**0.5, img_emb.dtype, img_emb.device
+            )
 
             # Expand mask to match image embedding sequence length
             bsize, num_img_embs = img_emb.shape[:2]
@@ -1054,7 +1084,11 @@ class VLAFlowMatching(nn.Module):
             # Add image end tokens if enabled
             if self.add_image_special_tokens:
                 end_emb = (
-                    self.vlm_with_expert.embed_language_tokens(self.image_end_token.to(device=img.device))
+                    self.vlm_with_expert.embed_language_tokens(
+                        self._device_constant(
+                            "image_end_token", self.image_end_token, torch.long, img.device
+                        )
+                    )
                     .unsqueeze(0)
                     .expand(img.shape[0], -1, -1)
                 )
@@ -1151,7 +1185,9 @@ class VLAFlowMatching(nn.Module):
         att_masks += [1] * self.config.chunk_size
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = self._device_constant(
+            ("suffix_att_masks", tuple(att_masks)), att_masks, embs.dtype, embs.device
+        )
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 

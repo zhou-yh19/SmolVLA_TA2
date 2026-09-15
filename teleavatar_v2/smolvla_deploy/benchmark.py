@@ -44,6 +44,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--attn-implementation", choices=("eager", "sdpa"), default="sdpa")
     parser.add_argument("--compile", dest="compile_model", action="store_true")
     parser.add_argument(
+        "--no-cuda-graph",
+        dest="cuda_graph",
+        action="store_false",
+        help="Time the eager kernel-by-kernel path instead of the CUDA graph replay",
+    )
+    parser.add_argument(
         "--profile-inference",
         action="store_true",
         help="Log the per-stage breakdown for each timed iteration",
@@ -110,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         precision=args.precision,
         attn_implementation=args.attn_implementation,
         compile_model=args.compile_model,
+        cuda_graph=args.cuda_graph,
     )
 
     observation = _synthetic_observation(runtime, args.image_hw, args.seed)
@@ -120,8 +127,8 @@ def main(argv: list[str] | None = None) -> int:
 
     for index in range(args.warmup):
         runtime.infer_action_chunk(observation, args.task)
-        if index == 0 and args.compile_model:
-            logging.info("First iteration done; compilation is out of the way")
+        if index == 0 and (args.compile_model or args.cuda_graph):
+            logging.info("First iteration done; compilation/capture is out of the way")
 
     timings = [runtime.infer_action_chunk(observation, args.task)[1] for _ in range(args.iters)]
     timings.sort()
