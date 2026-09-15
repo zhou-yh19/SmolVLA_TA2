@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 import sys
@@ -43,12 +45,14 @@ def load_policy_config(checkpoint_path: str | Path):
 class SmolVLARuntime:
     """Load one checkpoint and infer complete chunks without an action queue.
 
-    On CUDA the whole inference - uint8 frames in, unnormalized action chunk
-    out - is captured once into a CUDA graph and replayed afterwards. The
+    In stock Euler mode, CUDA inference - uint8 frames in, unnormalized action
+    chunk out - can be captured once into a CUDA graph and replayed afterwards. The
     eager path launches a few thousand small kernels from Python per chunk, and
     every launch has to reacquire the GIL; with the decoder and ROS2 callbacks
     running in the same process that turned an 86ms inference into 150-280ms
     with large jitter. A replay is one launch, so it is immune to that.
+    StreamTP uses eager execution because its residual gate chooses a dynamic
+    number of sequential sweeps.
     """
 
     def __init__(
@@ -65,6 +69,15 @@ class SmolVLARuntime:
         attn_implementation: str = "sdpa",
         compile_model: bool = False,
         cuda_graph: bool = True,
+        sampler: str = "euler",
+        streamtp_tolerance: float = 0.02,
+        streamtp_max_sweeps: int | None = None,
+        streamtp_anderson_depth: int = 3,
+        streamtp_anderson_regularization: float = 1e-4,
+        streamtp_warm_start: bool = True,
+        streamtp_shift_steps: int = 1,
+        metrics_jsonl: str | Path | None = None,
+        collect_metrics: bool = False,
     ) -> None:
         repo = Path(smolvla_repo).expanduser().resolve()
         source = repo / "src"
@@ -75,6 +88,7 @@ class SmolVLARuntime:
 
         import torch
         from lerobot.policies.smolvla2.modeling_smolvla2 import SmolVLA2Policy
+        from lerobot.policies.smolvla2.streamtp import StreamTPConfig
 
         checkpoint_path = Path(checkpoint).expanduser().resolve()
         if not (checkpoint_path / "config.json").is_file():
@@ -91,6 +105,18 @@ class SmolVLARuntime:
                 raise ValueError("num_steps must be positive")
             logging.info("Overriding flow denoising steps: %d -> %d", config.num_steps, num_steps)
             config.num_steps = int(num_steps)
+        if sampler not in ("euler", "streamtp"):
+            raise ValueError(f"sampler must be 'euler' or 'streamtp', got '{sampler}'")
+        self._sampler = sampler
+        self._streamtp_config = StreamTPConfig(
+            tolerance=streamtp_tolerance,
+            max_sweeps=int(config.num_steps if streamtp_max_sweeps is None else streamtp_max_sweeps),
+            anderson_depth=streamtp_anderson_depth,
+            anderson_regularization=streamtp_anderson_regularization,
+            warm_start=streamtp_warm_start,
+            shift_steps=streamtp_shift_steps,
+        )
+        self._streamtp_config.validate()
         # The hand-rolled attention in `smolvlm_with_expert2` defaults to an eager
         # kernel that materializes the full [B, H, Lq, Lk] score matrix in fp32.
         # Training keeps that for reproducibility; deployment has no such reason.
@@ -119,6 +145,14 @@ class SmolVLARuntime:
         self._device = torch.device(device)
         self._use_amp = config.use_amp if use_amp is None else bool(use_amp)
         self._profile_inference = bool(profile_inference)
+        self._metrics_path = Path(metrics_jsonl).expanduser() if metrics_jsonl is not None else None
+        if self._metrics_path is not None:
+            self._metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        self._collect_timing = self._profile_inference or self._metrics_path is not None or collect_metrics
+        self._call_index = 0
+        self._previous_model_actions = None
+        self.last_metrics: dict[str, object] = {}
+        self.last_normalized_actions: np.ndarray | None = None
         self._compute_dtype = self._resolve_precision(torch, precision, self._device)
         if self._compute_dtype is not None and self._use_amp:
             # Holding the weights in a narrow dtype already gives what autocast
@@ -155,7 +189,9 @@ class SmolVLARuntime:
             # the joint statistics the action chunk is unnormalized with.
             self.policy.model.to(dtype=self._compute_dtype)
         self._validate_normalization_statistics(self.policy)
-        self._cuda_graph_enabled = bool(cuda_graph) and self._device.type == "cuda"
+        self._cuda_graph_enabled = bool(cuda_graph) and self._device.type == "cuda" and sampler == "euler"
+        if cuda_graph and self._device.type == "cuda" and sampler == "streamtp":
+            logging.info("CUDA graph disabled for StreamTP because residual stopping has dynamic sweep depth")
         self._graph: _CapturedInference | None = None
         if compile_model and self._cuda_graph_enabled:
             # A replay has no Python between kernels, which is all the compiled
@@ -168,11 +204,12 @@ class SmolVLARuntime:
         self.chunk_size = int(config.chunk_size)
         _ckpt_dtype = getattr(config, "model_dtype", "fp32(mixed-legacy)")
         logging.info(
-            "Loaded SmolVLA: device=%s dtype=%s attn=%s cuda_graph=%s chunk_size=%d num_steps=%d "
+            "Loaded SmolVLA: device=%s dtype=%s attn=%s sampler=%s cuda_graph=%s chunk_size=%d num_steps=%d "
             "action_dim=%d (checkpoint stores state=%d action=%d)",
             self._device,
             self._compute_dtype or _ckpt_dtype,
             attn_implementation,
+            sampler,
             self._cuda_graph_enabled,
             self.chunk_size,
             int(config.num_steps),
@@ -240,11 +277,11 @@ class SmolVLARuntime:
         logging.info("Compiled denoise_step; the first chunk will include compilation time")
 
     def _synchronize_for_profile(self) -> None:
-        if self._profile_inference and self._device.type == "cuda":
+        if self._collect_timing and self._device.type == "cuda":
             self._torch.cuda.synchronize(self._device)
 
     def _profile_mark(self, marks: list[tuple[str, float]], name: str) -> None:
-        if self._profile_inference:
+        if self._collect_timing:
             self._synchronize_for_profile()
             marks.append((name, time.monotonic()))
 
@@ -365,28 +402,84 @@ class SmolVLARuntime:
             batch[key] = tensor.unsqueeze(0)
         return batch
 
-    def _finish_chunk(self, chunk: np.ndarray, marks: list[tuple[str, float]]) -> tuple[np.ndarray, float]:
+    def _finish_chunk(
+        self,
+        chunk: np.ndarray,
+        marks: list[tuple[str, float]],
+        sampler: str,
+        sampler_diagnostics: dict[str, object] | None = None,
+        record_metrics: bool = True,
+    ) -> tuple[np.ndarray, float]:
         elapsed_ms = (time.monotonic() - marks[0][1]) * 1000.0
+        stage_ms = {
+            f"{prev_name}_to_{name}_ms": (current_time - prev_time) * 1000.0
+            for (prev_name, prev_time), (name, current_time) in zip(marks[:-1], marks[1:], strict=True)
+        }
         if self._profile_inference:
-            parts = []
-            for (prev_name, prev_time), (name, current_time) in zip(
-                marks[:-1], marks[1:], strict=True
-            ):
-                parts.append(f"{prev_name}->{name}={(current_time - prev_time) * 1000.0:.1f}ms")
+            parts = [f"{name}={value:.1f}ms" for name, value in stage_ms.items()]
             logging.info("inference profile: %s total=%.1fms", " ".join(parts), elapsed_ms)
         if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM or not np.isfinite(chunk).all():
             raise RuntimeError(f"Policy returned an invalid action chunk: {chunk.shape}")
+        if record_metrics:
+            self._call_index += 1
+        metrics: dict[str, object] = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "call": self._call_index if record_metrics else None,
+            "sampler": sampler,
+            "total_ms": elapsed_ms,
+            "stages_ms": stage_ms,
+        }
+        if sampler_diagnostics is not None:
+            metrics[sampler] = sampler_diagnostics
+        self.last_metrics = metrics
+        if record_metrics and self._metrics_path is not None:
+            with self._metrics_path.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(metrics, sort_keys=True) + "\n")
         return chunk, elapsed_ms
 
-    def infer_action_chunk(self, observation: dict, task: str) -> tuple[np.ndarray, float]:
+    def reset_streamtp(self) -> None:
+        """Forget the cross-call warm start, e.g. at an episode boundary."""
+        self._previous_model_actions = None
+
+    def sample_noise(self, generator=None):
+        """Draw one model-space noise chunk for matched-noise A/B evaluation."""
+        shape = (1, self.chunk_size, int(self.policy.config.max_action_dim))
+        if generator is None:
+            return self.policy.model.sample_noise(shape, self._device)
+        return self._torch.randn(shape, dtype=self._torch.float32, device=self._device, generator=generator)
+
+    def infer_action_chunk(
+        self,
+        observation: dict,
+        task: str,
+        *,
+        sampler: str | None = None,
+        noise=None,
+        record_metrics: bool = True,
+    ) -> tuple[np.ndarray, float]:
         """Return unnormalized direct-trigger actions with shape [T, 16]."""
+        active_sampler = sampler or self._sampler
+        if active_sampler not in ("euler", "streamtp"):
+            raise ValueError(f"sampler must be 'euler' or 'streamtp', got '{active_sampler}'")
         marks: list[tuple[str, float]] = [("start", time.monotonic())]
         state, images = self._validate_observation(observation)
         self._profile_mark(marks, "validate")
-        if self._cuda_graph_enabled and all(image.dtype == np.uint8 for image in images.values()):
+        if (
+            active_sampler == "euler"
+            and noise is None
+            and self._cuda_graph_enabled
+            and all(image.dtype == np.uint8 for image in images.values())
+        ):
             graph = self._captured_inference(state, images, task)
-            return self._finish_chunk(graph.run(state, images, marks), marks)
-        return self._finish_chunk(self._infer_eager(state, images, task, marks), marks)
+            return self._finish_chunk(
+                graph.run(state, images, marks), marks, active_sampler, record_metrics=record_metrics
+            )
+        chunk, diagnostics = self._infer_eager(
+            state, images, task, marks, noise=noise, sampler=active_sampler
+        )
+        return self._finish_chunk(
+            chunk, marks, active_sampler, diagnostics, record_metrics=record_metrics
+        )
 
     def _infer_eager(
         self,
@@ -395,7 +488,8 @@ class SmolVLARuntime:
         task: str,
         marks: list[tuple[str, float]],
         noise=None,
-    ) -> np.ndarray:
+        sampler: str = "euler",
+    ) -> tuple[np.ndarray, dict[str, object] | None]:
         """Kernel-by-kernel inference; `noise` overrides the sampled flow noise (tests, graph check)."""
         torch = self._torch
         batch = self._make_batch(state, images, task)
@@ -414,15 +508,32 @@ class SmolVLARuntime:
             self._profile_mark(marks, "state")
             language_tokens, language_masks = self._prepare_language_cached(normalized, task)
             self._profile_mark(marks, "language")
-            actions = self.policy.model.sample_actions(
-                images,
-                image_masks,
-                language_tokens,
-                language_masks,
-                state,
-                noise=None if noise is None else noise.clone(),
-            )
+            if sampler == "streamtp":
+                actions, diagnostics = self.policy.model.sample_actions_streamtp(
+                    images,
+                    image_masks,
+                    language_tokens,
+                    language_masks,
+                    state,
+                    streamtp_config=self._streamtp_config,
+                    noise=None if noise is None else noise.clone(),
+                    previous_actions=self._previous_model_actions,
+                    collect_timing=self._collect_timing,
+                    residual_dim=ACTION_DIM,
+                )
+                self._previous_model_actions = actions.detach().clone()
+            else:
+                actions, diagnostics = self.policy.model.sample_actions_euler(
+                    images,
+                    image_masks,
+                    language_tokens,
+                    language_masks,
+                    state,
+                    noise=None if noise is None else noise.clone(),
+                    collect_timing=self._collect_timing,
+                )
             self._profile_mark(marks, "sample")
+            self.last_normalized_actions = actions[0].detach().to(dtype=torch.float32, device="cpu").numpy()
             # `sample_actions` always emits `max_action_dim` columns, so narrow
             # to whatever width the unnormalize buffers were saved at before
             # applying them, and only then down to the real TeleAvatar action.
@@ -431,7 +542,7 @@ class SmolVLARuntime:
             actions = actions[:, :, :ACTION_DIM]
         chunk = actions[0].detach().to(dtype=torch.float32, device="cpu").numpy()
         self._profile_mark(marks, "cpu")
-        return chunk
+        return chunk, diagnostics
 
     # --- CUDA graph path ----------------------------------------------------
 
@@ -618,7 +729,9 @@ class _CapturedInference:
     def _verify_against_eager(self, state: np.ndarray, images: dict[str, np.ndarray], task: str) -> None:
         """Replay once and compare with the eager path on the same noise."""
         runtime = self._runtime
-        expected = runtime._infer_eager(state, images, task, [("start", time.monotonic())], noise=self._noise)
+        expected, _ = runtime._infer_eager(
+            state, images, task, [("start", time.monotonic())], noise=self._noise
+        )
         self._graph.replay()
         actual = self._device_output.cpu().numpy()
         difference = float(np.abs(actual - expected).max())

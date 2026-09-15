@@ -27,6 +27,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", required=True, help="Language instruction used during inference")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--sampler", choices=("euler", "streamtp"), default="euler",
+        help="Use the original sequential Euler sampler or the accelerated StreamTP sampler",
+    )
+    parser.add_argument(
         "--num-steps",
         type=int,
         default=None,
@@ -36,6 +40,15 @@ def _parser() -> argparse.ArgumentParser:
         "--profile-inference",
         action="store_true",
         help="Log per-stage inference timing. Adds CUDA synchronizations, so use for diagnosis only.",
+    )
+    parser.add_argument("--streamtp-tolerance", type=float, default=0.02)
+    parser.add_argument("--streamtp-max-sweeps", type=int, default=None)
+    parser.add_argument("--streamtp-anderson-depth", type=int, default=3)
+    parser.add_argument("--streamtp-anderson-regularization", type=float, default=1e-4)
+    parser.add_argument("--streamtp-no-warm-start", action="store_true")
+    parser.add_argument(
+        "--metrics-jsonl", type=Path,
+        help="Append per-chunk module timings and sampler diagnostics to this JSONL file",
     )
     parser.add_argument(
         "--precision",
@@ -132,6 +145,14 @@ def main(argv: list[str] | None = None) -> int:
         attn_implementation=args.attn_implementation,
         compile_model=args.compile_model,
         cuda_graph=args.cuda_graph,
+        sampler=args.sampler,
+        streamtp_tolerance=args.streamtp_tolerance,
+        streamtp_max_sweeps=args.streamtp_max_sweeps,
+        streamtp_anderson_depth=args.streamtp_anderson_depth,
+        streamtp_anderson_regularization=args.streamtp_anderson_regularization,
+        streamtp_warm_start=not args.streamtp_no_warm_start,
+        streamtp_shift_steps=args.execution_horizon,
+        metrics_jsonl=args.metrics_jsonl,
     )
 
     rclpy.init()
@@ -162,10 +183,15 @@ def main(argv: list[str] | None = None) -> int:
             observation = robot.get_observation()
             if observation is None:
                 raise RuntimeError("Cannot warm up from missing or stale observation")
-            _, warmup_ms = runtime.infer_action_chunk(observation, args.task)
+            _, warmup_ms = runtime.infer_action_chunk(
+                observation, args.task, record_metrics=False
+            )
             logging.info(
                 "warmup %d/%d: inference=%.1fms", index + 1, args.warmup_chunks, warmup_ms
             )
+        # Warm-up actions were deliberately not executed, so they cannot be a
+        # valid shifted plan for the first control chunk.
+        runtime.reset_streamtp()
 
         while rclpy.ok():
             observation = robot.get_observation()
@@ -176,13 +202,21 @@ def main(argv: list[str] | None = None) -> int:
             actions = select_execution_actions(chunk, args.execution_horizon)
             chunk_count += 1
             logging.info(
-                "chunk=%d inference=%.1fms predicted=%d executing=%d first_triggers=(%.3f, %.3f)",
+                "chunk=%d sampler=%s inference=%.1fms predicted=%d executing=%d first_triggers=(%.3f, %.3f)%s",
                 chunk_count,
+                args.sampler,
                 inference_ms,
                 len(chunk),
                 len(actions),
                 actions[0, 7],
                 actions[0, 15],
+                (
+                    " sweeps={sweeps} residual={final_residual_rms:.5f} fallback={fallback}".format(
+                        **runtime.last_metrics["streamtp"]
+                    )
+                    if "streamtp" in runtime.last_metrics
+                    else ""
+                ),
             )
 
             # A dry run infers one chunk and leaves, unless --max-chunks asks it

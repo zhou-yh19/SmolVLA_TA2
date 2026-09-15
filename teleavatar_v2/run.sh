@@ -1,0 +1,11 @@
+python scripts/bench_inference.py \
+    --checkpoint /path/to/checkpoint/pretrained_model \
+    --smolvla-repo .. \
+    --device cuda \
+    --task "catch the rolling ball or bottle and put it in the basket." \
+    --sampler compare \
+    --warmup 5 \
+    --iters 60 \
+    --streamtp-tolerance 0.02 \
+    --metrics-jsonl ../outputs/streamtp_ab.jsonl \
+    --summary-json ../outputs/streamtp_ab_summary.json

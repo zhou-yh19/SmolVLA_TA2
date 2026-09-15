@@ -49,6 +49,17 @@ DEVICE="${DEVICE:-cuda}"
 # values cut inference time nearly linearly; validate quality on hardware.
 NUM_STEPS="${NUM_STEPS:-}"
 PROFILE_INFERENCE="${PROFILE_INFERENCE:-0}"
+# Inference algorithm: euler preserves the existing implementation; streamtp
+# enables the residual-governed parallel sampler from the paper.
+SAMPLER="${SAMPLER:-euler}" #streamtp
+STREAMTP_TOLERANCE="${STREAMTP_TOLERANCE:-0.02}"
+STREAMTP_MAX_SWEEPS="${STREAMTP_MAX_SWEEPS:-}"
+STREAMTP_ANDERSON_DEPTH="${STREAMTP_ANDERSON_DEPTH:-3}"
+STREAMTP_ANDERSON_REGULARIZATION="${STREAMTP_ANDERSON_REGULARIZATION:-0.0001}"
+STREAMTP_WARM_START="${STREAMTP_WARM_START:-1}"
+# Optional per-call JSONL. Set this for paper tables; logging happens after the
+# measured inference interval so file I/O is not charged to latency.
+METRICS_JSONL="${METRICS_JSONL:-}"  #outputs/streamtp_robot.jsonl
 # Backbone dtype. Empty (default) = load the checkpoint as-is, preserving the
 # dtype layout it was trained with (matches training exactly). Explicit fp32/bf16/fp16
 # forces all backbone weights to that dtype after loading; only use this to
@@ -286,6 +297,7 @@ bench)
         "${VLM_FLAG[@]}"
         --device "${DEVICE}"
         --task "${TASK}"
+        --sampler "${SAMPLER}"
         --iters "${BENCH_ITERS}"
         --control-frequency "${CONTROL_FREQUENCY}"
         --execution-horizon "${EXECUTION_HORIZON}"
@@ -296,6 +308,12 @@ bench)
     [[ "${CUDA_GRAPH}" != "1" ]] && bench_args+=(--no-cuda-graph)
     [[ "${COMPILE_MODEL}" == "1" ]] && bench_args+=(--compile)
     [[ "${PROFILE_INFERENCE}" == "1" ]] && bench_args+=(--profile-inference)
+    bench_args+=(--streamtp-tolerance "${STREAMTP_TOLERANCE}")
+    bench_args+=(--streamtp-anderson-depth "${STREAMTP_ANDERSON_DEPTH}")
+    bench_args+=(--streamtp-anderson-regularization "${STREAMTP_ANDERSON_REGULARIZATION}")
+    [[ -n "${STREAMTP_MAX_SWEEPS}" ]] && bench_args+=(--streamtp-max-sweeps "${STREAMTP_MAX_SWEEPS}")
+    [[ "${STREAMTP_WARM_START}" != "1" ]] && bench_args+=(--streamtp-no-warm-start)
+    [[ -n "${METRICS_JSONL}" ]] && bench_args+=(--metrics-jsonl "${METRICS_JSONL}")
 
     exec python scripts/bench_inference.py "${bench_args[@]}"
     ;;
@@ -313,6 +331,7 @@ diagnose)
         "${VLM_FLAG[@]}"
         --device "${DEVICE}"
         --task "${TASK}"
+        --sampler "${SAMPLER}"
         --gap-s "$(python -c "print(${EXECUTION_HORIZON} / ${CONTROL_FREQUENCY})")"
         --rtp-port "${RTP_PORT}"
         --arm-config "${DEPLOY_ROOT}/arm_config.yml"
@@ -322,6 +341,12 @@ diagnose)
     diag_args+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
     [[ "${CUDA_GRAPH}" != "1" ]] && diag_args+=(--no-cuda-graph)
     [[ "${COMPILE_MODEL}" == "1" ]] && diag_args+=(--compile)
+    diag_args+=(--streamtp-tolerance "${STREAMTP_TOLERANCE}")
+    diag_args+=(--streamtp-anderson-depth "${STREAMTP_ANDERSON_DEPTH}")
+    diag_args+=(--streamtp-anderson-regularization "${STREAMTP_ANDERSON_REGULARIZATION}")
+    diag_args+=(--streamtp-shift-steps "${EXECUTION_HORIZON}")
+    [[ -n "${STREAMTP_MAX_SWEEPS}" ]] && diag_args+=(--streamtp-max-sweeps "${STREAMTP_MAX_SWEEPS}")
+    [[ "${STREAMTP_WARM_START}" != "1" ]] && diag_args+=(--streamtp-no-warm-start)
     exec python scripts/diagnose_latency.py "${diag_args[@]}"
     ;;
 
@@ -362,6 +387,7 @@ dry|run)
         "${VLM_FLAG[@]}"
         --device "${DEVICE}"
         --task "${TASK}"
+        --sampler "${SAMPLER}"
         --control-frequency "${CONTROL_FREQUENCY}"
         --execution-horizon "${EXECUTION_HORIZON}"
         --max-joint-step-rad "${MAX_JOINT_STEP_RAD}"
@@ -374,6 +400,12 @@ dry|run)
     [[ "${CUDA_GRAPH}" != "1" ]] && run_args+=(--no-cuda-graph)
     [[ "${COMPILE_MODEL}" == "1" ]] && run_args+=(--compile)
     [[ "${PROFILE_INFERENCE}" == "1" ]] && run_args+=(--profile-inference)
+    run_args+=(--streamtp-tolerance "${STREAMTP_TOLERANCE}")
+    run_args+=(--streamtp-anderson-depth "${STREAMTP_ANDERSON_DEPTH}")
+    run_args+=(--streamtp-anderson-regularization "${STREAMTP_ANDERSON_REGULARIZATION}")
+    [[ -n "${STREAMTP_MAX_SWEEPS}" ]] && run_args+=(--streamtp-max-sweeps "${STREAMTP_MAX_SWEEPS}")
+    [[ "${STREAMTP_WARM_START}" != "1" ]] && run_args+=(--streamtp-no-warm-start)
+    [[ -n "${METRICS_JSONL}" ]] && run_args+=(--metrics-jsonl "${METRICS_JSONL}")
     [[ "${MAX_CHUNKS}" != "0" ]] && run_args+=(--max-chunks "${MAX_CHUNKS}")
 
     echo "[info] task: ${TASK}"

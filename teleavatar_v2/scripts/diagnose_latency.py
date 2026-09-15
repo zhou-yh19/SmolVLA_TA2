@@ -44,7 +44,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--vlm-model-path", type=Path)
     parser.add_argument("--task", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--sampler", choices=("euler", "streamtp"), default="euler")
     parser.add_argument("--num-steps", type=int, default=None)
+    parser.add_argument("--streamtp-tolerance", type=float, default=0.02)
+    parser.add_argument("--streamtp-max-sweeps", type=int, default=None)
+    parser.add_argument("--streamtp-anderson-depth", type=int, default=3)
+    parser.add_argument("--streamtp-anderson-regularization", type=float, default=1e-4)
+    parser.add_argument("--streamtp-no-warm-start", action="store_true")
+    parser.add_argument("--streamtp-shift-steps", type=int, default=1)
     parser.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default=None)
     parser.add_argument("--attn-implementation", choices=("eager", "sdpa"), default="sdpa")
     parser.add_argument("--compile", dest="compile_model", action="store_true")
@@ -103,6 +110,13 @@ def main(argv: list[str] | None = None) -> int:
         attn_implementation=args.attn_implementation,
         compile_model=args.compile_model,
         cuda_graph=args.cuda_graph,
+        sampler=args.sampler,
+        streamtp_tolerance=args.streamtp_tolerance,
+        streamtp_max_sweeps=args.streamtp_max_sweeps,
+        streamtp_anderson_depth=args.streamtp_anderson_depth,
+        streamtp_anderson_regularization=args.streamtp_anderson_regularization,
+        streamtp_warm_start=not args.streamtp_no_warm_start,
+        streamtp_shift_steps=args.streamtp_shift_steps,
     )
     synthetic = _synthetic_observation(runtime, None, 0)
     results: dict[str, list[float]] = {}

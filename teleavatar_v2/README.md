@@ -210,8 +210,9 @@ python scripts/run_smolvla.py \
   --profile-inference --max-chunks 60
 ```
 
-For speed/quality A/B tests, reduce the flow denoising steps from the
-checkpoint default, usually 10:
+The original sampler remains the default. Select the paper's accelerated
+StreamTP sampler explicitly; its defaults match the controlled SmolVLA study
+(`tol=0.02`, Anderson depth 3, at most the checkpoint's K sweeps):
 
 ```bash
 python scripts/run_smolvla.py \
@@ -219,8 +220,41 @@ python scripts/run_smolvla.py \
   --smolvla-repo /path/to/SmolVLA_TA2 \
   --device cuda \
   --task "stack the three blocks" \
-  --num-steps 6
+  --sampler streamtp \
+  --streamtp-tolerance 0.02 \
+  --metrics-jsonl outputs/streamtp_robot.jsonl
 ```
+
+For a controlled offline comparison, `compare` alternates method order and
+uses identical noise for Euler-10 and StreamTP. It reports latency, speedup,
+normalized action RMS, sweep/evaluation counts, fallback rate, prefix/solver
+time, and writes every module-level record:
+
+```bash
+python scripts/bench_inference.py \
+  --checkpoint /path/to/checkpoint/pretrained_model \
+  --smolvla-repo /path/to/SmolVLA_TA2 \
+  --device cuda --task "stack the three blocks" \
+  --sampler compare --warmup 5 --iters 60 \
+  --streamtp-tolerance 0.02 \
+  --metrics-jsonl outputs/streamtp_ab.jsonl \
+  --summary-json outputs/streamtp_ab_summary.json
+```
+
+Each JSONL row records end-to-end and preprocessing stages. StreamTP rows also
+contain `prefix_ms`, `solver_ms`, every batched `sweep_times_ms`, Anderson and
+fallback time, final residual, critical NFE, total expert evaluations, warm/cold
+initialization, shifted-plan RMS, fallback status, and incremental peak GPU
+memory. The summary also reports the plan-shift/sweep Pearson correlation when
+it is defined. The benchmark always uses synchronized
+module boundaries; `--metrics-jsonl` persists those records. In the robot
+runner, recording/profile mode enables the same synchronization, so compare
+latency only with runs that use the same mode.
+StreamTP automatically disables the existing fixed-shape CUDA graph because
+residual stopping has a data-dependent number of sweeps. The matched-noise
+`compare` arm therefore evaluates both algorithms in eager mode. Also run a
+separate `--sampler euler` benchmark with the default CUDA graph when deciding
+which path is fastest on the deployment host.
 
 `bench_inference.py`, `run_smolvla.py` and every stage of
 `scripts/deploy_small_ta2_robot.sh` share the same speed switches:
@@ -230,6 +264,12 @@ python scripts/run_smolvla.py \
 | `--precision {fp32,bf16,fp16}` | `PRECISION` | empty (no conversion) | post-load dtype override. Empty (the default) loads the checkpoint as stored, which is correct for both old mixed-dtype checkpoints and new uniform ones trained with `MODEL_DTYPE=bf16`. Set explicitly only to test numerics or force a specific dtype. |
 | `--attn-implementation {sdpa,eager}` | `ATTN_IMPLEMENTATION` | `sdpa` | `sdpa` uses the fused kernel; `eager` materializes the full score matrix and matches training exactly. |
 | `--num-steps N` | `NUM_STEPS` | checkpoint value (10) | flow denoising steps. Time is roughly linear in this; quality is not — validate on hardware. |
+| `--sampler {euler,streamtp}` | `SAMPLER` | `euler` | preserve the stock sampler or enable StreamTP. The benchmark additionally accepts `compare`. |
+| `--streamtp-tolerance X` | `STREAMTP_TOLERANCE` | `0.02` | endpoint RMS stopping threshold calibrated in the paper for SmolVLA. Recalibrate for a new checkpoint/task. |
+| `--streamtp-max-sweeps N` | `STREAMTP_MAX_SWEEPS` | K | sweep cap; a miss triggers exact same-noise sequential Euler fallback. |
+| `--streamtp-anderson-depth N` | `STREAMTP_ANDERSON_DEPTH` | `3` | safeguarded Type-II Anderson history; use 0 for plain Picard. |
+| `--streamtp-no-warm-start` | `STREAMTP_WARM_START=0` | warm start on | cold-start every accelerated call; fresh noise is still drawn in both modes. |
+| `--metrics-jsonl PATH` | `METRICS_JSONL` | off | append per-call timing and solver diagnostics after the measured interval. |
 | `--no-cuda-graph` | `CUDA_GRAPH=0` | graph on | run the eager kernel-by-kernel path instead of replaying one CUDA graph per chunk. Several times slower under decoder/ROS load; only for diagnosing a capture problem. |
 | `--compile` | `COMPILE_MODEL=1` | off | `torch.compile` the denoise step on the eager path. Ignored under the CUDA graph, which already removes the launch overhead. |
 | `--profile-inference` | `PROFILE_INFERENCE=1` | off | per-stage timing on every chunk. |

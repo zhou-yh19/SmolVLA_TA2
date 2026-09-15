@@ -57,6 +57,7 @@ import math
 import os
 import random
 import re
+import time
 from collections import deque
 
 import safetensors
@@ -74,6 +75,7 @@ from lerobot.policies.normalize import (
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.smolvla2.smolvlm_with_expert2 import SmolVLMWithExpertModel
 from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config
+from lerobot.policies.smolvla2.streamtp import StreamTPConfig, streamtp_solve
 from lerobot.policies.utils import (
     populate_queues,
 )
@@ -1229,21 +1231,13 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
-    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = state.shape[0]
-        device = state.device
-
-        if noise is None:
-            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
+    def _prepare_inference_prefix(self, images, img_masks, lang_tokens, lang_masks, state):
+        """Embed the observation once and return the reusable expert context."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        # Compute image and language key value cache
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
@@ -1252,45 +1246,165 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
-        if self.config.regression_loss:
-            x_t = torch.zeros_like(noise, dtype=torch.float32, device=device)
-            expanded_time = torch.zeros(bsize, dtype=torch.float32, device=device)
-            x_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
-        else:
-            # Keep the Euler schedule on the host. When `dt` and `time` were CUDA
-            # scalars, evaluating the `while` condition below forced a device
-            # synchronization on every step, so the launch queue drained once per
-            # denoise step and the expert's kernel-launch overhead was fully
-            # exposed instead of being overlapped with the previous step.
-            #
-            # `time` stays a float32 tensor and `dt` is rounded to float32 so the
-            # accumulation below rounds exactly as it did on the device; only the
-            # device changes. Accumulating in Python's float64 instead would shift
-            # the timesteps by an ulp, which is small but not nothing: the
-            # velocity field is evaluated at a different point at every step.
-            dt = float(torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32))
+        return prefix_pad_masks, past_key_values
 
-        x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32)
-        while time >= -dt / 2:
-            expanded_time = torch.full((bsize,), float(time), dtype=torch.float32, device=device)
-            v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
+    def _sample_euler_from_prefix(self, state, prefix_pad_masks, past_key_values, noise):
+        """Run the checkpoint's reference Euler discretization from fixed noise."""
+        if self.config.regression_loss:
+            expanded_time = torch.zeros(state.shape[0], dtype=torch.float32, device=state.device)
+            return self.denoise_step(
+                state, prefix_pad_masks, past_key_values, torch.zeros_like(noise), expanded_time
             )
-            # Euler step
-            x_t += dt * v_t
-            time += dt
+
+        # Keep the schedule construction byte-for-byte aligned with the stock
+        # implementation: float32 host accumulation, K evaluations at t=1..1/K.
+        dt = float(torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32))
+        x_t = noise.clone()
+        current_time = torch.tensor(1.0, dtype=torch.float32)
+        for _ in range(self.config.num_steps):
+            expanded_time = torch.full(
+                (state.shape[0],), float(current_time), dtype=torch.float32, device=state.device
+            )
+            x_t += dt * self.denoise_step(
+                state, prefix_pad_masks, past_key_values, x_t, expanded_time
+            )
+            current_time += dt
         return x_t
+
+    @staticmethod
+    def _repeat_prefix_value(value, repeats: int):
+        """Repeat the batch dimension throughout the nested KV-cache structure."""
+        if isinstance(value, Tensor):
+            return value.repeat_interleave(repeats, dim=0)
+        if isinstance(value, dict):
+            return {key: VLAFlowMatching._repeat_prefix_value(item, repeats) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(VLAFlowMatching._repeat_prefix_value(item, repeats) for item in value)
+        if isinstance(value, list):
+            return [VLAFlowMatching._repeat_prefix_value(item, repeats) for item in value]
+        return value
+
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> Tensor:
+        """Run the original sequential Euler sampler."""
+        actions, _ = self.sample_actions_euler(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise
+        )
+        return actions
+
+    def sample_actions_euler(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        *,
+        noise=None,
+        collect_timing: bool = False,
+    ) -> tuple[Tensor, dict[str, object]]:
+        """Run stock Euler and optionally separate prefix and solver timing."""
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        if collect_timing and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        prefix_started = time.perf_counter()
+        prefix_pad_masks, past_key_values = self._prepare_inference_prefix(
+            images, img_masks, lang_tokens, lang_masks, state
+        )
+        if collect_timing and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        prefix_ms = (time.perf_counter() - prefix_started) * 1000.0 if collect_timing else 0.0
+        solver_started = time.perf_counter()
+        actions = self._sample_euler_from_prefix(state, prefix_pad_masks, past_key_values, noise)
+        if collect_timing and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        solver_ms = (time.perf_counter() - solver_started) * 1000.0 if collect_timing else 0.0
+        return actions, {
+            "prefix_ms": prefix_ms,
+            "solver_ms": solver_ms,
+            "critical_nfe": int(self.config.num_steps),
+            "expert_evaluations": int(self.config.num_steps),
+        }
+
+    def sample_actions_streamtp(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        *,
+        streamtp_config: StreamTPConfig,
+        noise=None,
+        previous_actions=None,
+        collect_timing: bool = False,
+        residual_dim: int | None = None,
+    ) -> tuple[Tensor, dict[str, object]]:
+        """Run residual-governed, prefix-shared parallel Picard sampling."""
+        if self.config.regression_loss:
+            raise ValueError("StreamTP applies to flow-matching checkpoints, not regression_loss models")
+        if not self.config.use_cache:
+            raise ValueError("StreamTP requires use_cache=True so all time points can share the VLM prefix")
+        bsize = state.shape[0]
+        if noise is None:
+            noise = self.sample_noise(
+                (bsize, self.config.chunk_size, self.config.max_action_dim), state.device
+            )
+
+        if collect_timing and state.device.type == "cuda":
+            torch.cuda.synchronize(state.device)
+        prefix_started = time.perf_counter()
+        prefix_pad_masks, past_key_values = self._prepare_inference_prefix(
+            images, img_masks, lang_tokens, lang_masks, state
+        )
+        if collect_timing and state.device.type == "cuda":
+            torch.cuda.synchronize(state.device)
+        prefix_ms = (time.perf_counter() - prefix_started) * 1000.0 if collect_timing else 0.0
+
+        contexts = {1: (state, prefix_pad_masks, past_key_values)}
+
+        def velocity_fn(points: Tensor, timesteps: Tensor) -> Tensor:
+            if points.shape[0] % bsize:
+                raise ValueError("Folded StreamTP batch is not divisible by the observation batch")
+            repeats = points.shape[0] // bsize
+            context = contexts.get(repeats)
+            if context is None:
+                context = (
+                    state.repeat_interleave(repeats, dim=0),
+                    prefix_pad_masks.repeat_interleave(repeats, dim=0),
+                    self._repeat_prefix_value(past_key_values, repeats),
+                )
+                contexts[repeats] = context
+            repeated_state, repeated_masks, repeated_cache = context
+            return self.denoise_step(
+                repeated_state, repeated_masks, repeated_cache, points, timesteps
+            )
+
+        solver_started = time.perf_counter()
+        actions, diagnostics = streamtp_solve(
+            velocity_fn,
+            noise.clone(),
+            num_steps=int(self.config.num_steps),
+            config=streamtp_config,
+            previous_actions=previous_actions,
+            collect_timing=collect_timing,
+            residual_dim=resolved_action_dim(self.config) if residual_dim is None else residual_dim,
+            fallback_fn=lambda fresh_noise: self._sample_euler_from_prefix(
+                state, prefix_pad_masks, past_key_values, fresh_noise
+            ),
+        )
+        if collect_timing and state.device.type == "cuda":
+            torch.cuda.synchronize(state.device)
+        diagnostics["prefix_ms"] = prefix_ms
+        diagnostics["solver_ms"] = (
+            (time.perf_counter() - solver_started) * 1000.0 if collect_timing else 0.0
+        )
+        return actions, diagnostics
 
     def denoise_step(
         self,
